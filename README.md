@@ -1,1 +1,3 @@
-# My Project Title
+# AlgoFarmBT
+
+Backtesting Module for AlgoFarm
