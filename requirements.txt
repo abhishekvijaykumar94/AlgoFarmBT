@@ -1,5 +1,6 @@
 aiohttp==3.9.3
 aiosignal==1.3.1
+-e git+https://github.com/abhishekvijaykumar94/algoLibs.git@3c392341783b6adfd17d9cca9bb99ce5a28f5e87#egg=algoLibs
 async-timeout==4.0.3
 attrs==23.2.0
 Brotli==1.1.0
