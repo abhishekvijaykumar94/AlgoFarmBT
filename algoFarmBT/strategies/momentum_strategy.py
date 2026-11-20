@@ -245,9 +245,11 @@ class MomentumPoint:
 
 
 class _State:
-    def __init__(self, recipe, capture=False):
+    def __init__(self, recipe, capture=False, excluded=False, excluded_horizons=()):
         self.recipe = recipe
         self.capture = capture
+        self.excluded = excluded
+        self.excluded_horizons = frozenset(excluded_horizons)
         self.emas = {span: ExponentialMovingAverage(span, adjust=False, min_periods=1) for fast, slow, _ in recipe.horizons for span in (fast, slow)}
         self.signals = [ExponentialMovingAverage(recipe.signal_span, adjust=False, min_periods=1) if recipe.signal_span else None for _ in recipe.horizons]
         self.smoothed = [ExponentialMovingAverage(recipe.smoothing_span, adjust=False, min_periods=1) for _ in recipe.horizons]
@@ -297,11 +299,14 @@ class _State:
             clipped = min(r.forecast_clip, max(-r.forecast_clip, normalised))
             forecasts.append(self.smoothed[i].update(clipped))
             if self.capture:
-                horizon_points.append(HorizonPoint(fast, slow, r.horizons[i][2], histogram, normalised,
-                    clipped, forecasts[-1], forecasts[-1] * r.horizons[i][2],
+                weight = Decimal(0) if (fast, slow) in self.excluded_horizons else r.horizons[i][2]
+                horizon_points.append(HorizonPoint(fast, slow, weight, histogram, normalised,
+                    clipped, forecasts[-1], forecasts[-1] * weight,
                     normalised < -r.forecast_clip, normalised > r.forecast_clip))
-        forecast = sum((v * w for v, (_, _, w) in zip(forecasts, r.horizons)), Decimal(0))
-        budget, cap = dict(r.symbol_budgets)[bar.symbol], dict(r.weight_caps)[bar.symbol]
+        forecast = sum((v * w for v, (fast, slow, w) in zip(forecasts, r.horizons)
+                        if (fast, slow) not in self.excluded_horizons), Decimal(0))
+        budget, cap = ((Decimal(0), Decimal(0)) if self.excluded else
+                       (dict(r.symbol_budgets)[bar.symbol], dict(r.weight_caps)[bar.symbol]))
         uncapped_weight = budget * max(Decimal(0), forecast) * r.vol_target / annual_vol * regime * breaker
         weight = min(cap, uncapped_weight)
         before_precision = weight
@@ -319,11 +324,17 @@ class _State:
 
 class MomentumStrategy(CoreTradingStrategy):
     """Prepared-bar target strategy using the project's strategy lifecycle."""
-    def __init__(self, recipe, auxiliary=(), trace=None):
+    def __init__(self, recipe, auxiliary=(), trace=None, *, excluded_symbols=(), excluded_horizons=()):
         super().__init__(recipe.name, True, recipe.warmup_bars)
         self.recipe = recipe
         self.auxiliary = auxiliary
         self.trace = trace
+        self.excluded_symbols = frozenset(excluded_symbols)
+        self.excluded_horizons = frozenset(tuple(pair) for pair in excluded_horizons)
+        symbols = set(dict(recipe.symbol_budgets))
+        horizons = {(fast, slow) for fast, slow, _ in recipe.horizons}
+        if not self.excluded_symbols < symbols or not self.excluded_horizons < horizons:
+            raise ValueError('Exclusions must be known and leave at least one asset and horizon')
 
     def apply_indicators(self, frame):
         """Prepare causal feature records for one complete bar frame."""
@@ -342,7 +353,7 @@ class MomentumStrategy(CoreTradingStrategy):
             raise ValueError('Momentum run needs complete hourly intervals')
         with localcontext() as context:
             context.prec = 50
-            self._states = states = {symbol: _State(recipe, trace is not None) for symbol, _ in recipe.symbol_budgets}
+            self._states = states = {symbol: _State(recipe, trace is not None, symbol in self.excluded_symbols, self.excluded_horizons) for symbol, _ in recipe.symbol_budgets}
             self._book = book = _AuxiliaryBook(auxiliary, recipe)
         previous, began = None, False
         for timestamp, rows in groupby(chain.from_iterable(source), key=lambda b: b.start):

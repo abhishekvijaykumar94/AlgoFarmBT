@@ -77,3 +77,19 @@ Native bar/derivative access is available for research. The legacy equity execut
 Normal prepared runs now include Summary, Performance, Assets, Trades, Signals and Run details, with supporting source tables. `research.json` is the canonical combined payload; base `report.json` remains available. Assets/Trades use retained shared-ledger evidence and preserve marking residuals. Completed position episodes are distinct from fills and from open episodes. Signals contains explicit unavailable sections when no retained trace was requested; use `--trace` for exact intermediate forecasts and execution audit evidence. Diagnostics do not rerun or change the strategy.
 
 Daily risk uses complete UTC days with 365-day annualisation and declared zero risk-free/downside-target conventions. Full-run P&L and retained hourly statistics include partial periods; their different sample bounds are displayed. Historical 95% expected shortfall requires at least 100 complete days under the documented research policy, so the current 77-complete-day baseline reports it unavailable. This is a sample eligibility convention, not an allocation threshold. Fixed risky-plus-cash references are supported via explicit report configuration and are never fitted to the evaluated full sample.
+
+## Controlled robustness comparisons
+
+Run a bounded, predeclared set of actual Backtest reruns:
+
+```bash
+python -m algoFarmBT.backtests.execute_momentum_backtest compare --snapshot qualified-prices --spec run.json --recipe recipe.json --cases examples/momentum.robustness.json --output robustness-run
+```
+
+The plan starts with an unchanged baseline and contains at most 32 named cases. Supported interventions are fee multipliers (both percentage and fixed fees), adverse-slippage multipliers, execution delays of 0–168 complete bars, and explicit symbol/horizon exclusions. No optimiser or automatic selection is included. All cases retain the same frozen prices, run bounds, warmup, capital and original benchmark weights. Excluded assets remain in the marked universe with zero target budget; their capital stays in cash. Excluded horizon contributions become zero before composite/allocation calculations; the remaining original weights are not rescaled.
+
+Delayed decisions retain known-at times and execute at the later bar open. Executions at or beyond the end boundary are censored and saved in each run's `target-timing.jsonl`; end holdings remain marked, without a forced liquidation. `--trace` additionally retains full intermediate calculation/execution diagnostics.
+
+The output freezes common prices, plan, recipe and run configuration once, saves every case and its manifest/run ID (including a failure receipt when a case fails), and writes matching `comparison.json` and `comparison.xlsx`. Summary/Performance compare actual net results, risk, exposure, costs, turnover and execution effects, with relative links to each case report. Undefined values remain unavailable. A joint fee/slippage sign-change bracket uses observed rerun endpoints only; the separate same-fill fee diagnostic is not a zero-cost rerun. Marginal ablation differences are not additive P&L contributions.
+
+Replay using the archived `source.zip`, `common/prices`, `common/spec.json`, `common/recipe.json` and `common/plan.json` (plus `common/auxiliary.json` when present). Existing outputs are never overwritten. Price inputs are copied and verified before any case runs, and the suite manifest hashes every retained artifact. Results on previously inspected history remain development research.

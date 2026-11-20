@@ -47,16 +47,9 @@ def _json(value):
     return json.dumps(encode(value), sort_keys=True, separators=(',', ':'), allow_nan=False)
 
 
-def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
-                 attachments=None, annualisation_hours=None, benchmark_weights=None, expected_data_id=None, strategy_controller=None,
-                 fixed_reference_weights=None, report_context=None, signal_trace=None, retain_diagnostics=False):
-    destination = Path(destination)
-    if destination.exists():
-        raise FileExistsError(destination)
-    source = QualifiedSpotSource(snapshot)
-    if expected_data_id is not None and source.data_id != expected_data_id:
-        raise ValueError('Snapshot changed after target preparation')
-    raw = json.loads(Path(config).read_text())
+def resolve_run_spec(raw, data_id, code_id):
+    """Validate common run inputs before any related case is attempted."""
+    raw = dict(raw)
     seconds = raw.pop('interval_seconds')
     if type(seconds) is not int or seconds <= 0:
         raise ValueError('interval_seconds must be a positive integer')
@@ -64,8 +57,21 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
     raw['rules'] = tuple(SpotRules(**r) for r in raw['rules'])
     if 'data_id' in raw or 'code_id' in raw:
         raise ValueError('Data and code identities are resolved from actual inputs')
+    return SpotRunSpec(**raw, data_id=data_id, code_id=code_id), seconds
+
+
+def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
+                 attachments=None, annualisation_hours=None, benchmark_weights=None, expected_data_id=None, strategy_controller=None,
+                 fixed_reference_weights=None, report_context=None, signal_trace=None, retain_diagnostics=False,
+                 execution_delay_bars=0):
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError(destination)
+    source = QualifiedSpotSource(snapshot)
+    if expected_data_id is not None and source.data_id != expected_data_id:
+        raise ValueError('Snapshot changed after target preparation')
     code_id, code_files = source_snapshot()
-    spec = SpotRunSpec(**raw, data_id=source.data_id, code_id=code_id)
+    spec, seconds = resolve_run_spec(json.loads(Path(config).read_text()),source.data_id,code_id)
     # References are declared before evaluating any strategy returns.
     with localcontext() as decimal_context:
         decimal_context.prec=28
@@ -74,14 +80,14 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
     fixed_reference_weights=dict(fixed_reference_weights) if fixed_reference_weights is not None else None
     context=dict(report_context or {})
     if strategy_controller is not None:
-        backtest = Backtest.from_prepared(spec, source, strategy=strategy_controller, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics)
+        backtest = Backtest.from_prepared(spec, source, strategy=strategy_controller, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars)
         result = backtest.run()
         rows = [dict(time=t.time.isoformat(),weights={s:str(w) for s,w in t.weights},rebalance=t.rebalance) for t in backtest.target_log]
         targets_raw = json.dumps(rows,sort_keys=True,separators=(',',':')).encode()
     else:
         targets_raw = Path(targets_path).read_bytes()
         targets = [SpotTarget(**t) for t in json.loads(targets_raw)]
-        backtest = Backtest.from_prepared(spec, source, targets=targets, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics)
+        backtest = Backtest.from_prepared(spec, source, targets=targets, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars)
         result = backtest.run()
     report = backtest.performance_report()
     benchmarks = spot_benchmarks(spec, source, benchmark_weights, annualisation_hours,
@@ -100,6 +106,10 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
                     targets_sha256=hashlib.sha256(targets_raw).hexdigest(), environment=environment,
                     strategy=strategy or 'externally-supplied-targets', files={})
     context.update(resolved_parameters=body['spec'],strategy=strategy or 'externally-supplied-targets',
+                   execution_schedule=dict(delay_bars=execution_delay_bars,
+                       policy='Decision known at target time; execute at that opening plus delay complete bars; censor execution >= end; retain final positions',
+                       scheduled=sum(r['status']=='scheduled' for r in backtest.target_timing),
+                       censored=sum(r['status']=='censored_at_run_end' for r in backtest.target_timing)),
                    environment=environment,source_manifest=source.manifest,
                    coverage=dict(source_start=utc(source.manifest['start']),source_end=utc(source.manifest['end']),
                                  execution_start=spec.start,execution_end=spec.end,
@@ -119,6 +129,7 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
         (stage / 'result.json').write_text(_json(body))
         (stage / 'spec.json').write_text(_json(body['spec']))
         (stage / 'targets.json').write_bytes(targets_raw)
+        (stage / 'target-timing.jsonl').write_text(''.join(_json(row)+'\n' for row in backtest.target_timing))
         (stage / 'report.json').write_text(_json(report))
         (stage / 'research.json').write_text(_json(research))
         (stage / 'signals.json').write_text(_json(sections['signals']))
@@ -129,7 +140,7 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
             (stage / 'benchmarks.json').write_text(_json(benchmarks))
         for name, content in (attachments or {}).items():
             if Path(name).name != name or name in ('result.json','spec.json','targets.json','report.json',
-                                                   'benchmarks.json','research.json','signals.json','execution-trace.jsonl','report.xlsx','source.zip','manifest.json','manifest.sha256'):
+                                                   'target-timing.jsonl','benchmarks.json','research.json','signals.json','execution-trace.jsonl','report.xlsx','source.zip','manifest.json','manifest.sha256'):
                 raise ValueError('Invalid or reserved attachment name')
             (stage / name).write_bytes(content() if callable(content) else content)
         with zipfile.ZipFile(stage / 'source.zip', 'w', compression=zipfile.ZIP_DEFLATED) as archive:
@@ -151,7 +162,8 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
 
 
 def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None, retain_trace=False, *,
-                 fixed_reference_weights=None, report_context=None):
+                 fixed_reference_weights=None, report_context=None, execution_delay_bars=0,
+                 excluded_symbols=(), excluded_horizons=()):
     """Prepare a fully configured recipe, then replay its known-at targets."""
     from ..strategies.momentum_strategy import AuxiliaryObservation, MomentumStrategy, load_recipe
     if Path(destination).exists():
@@ -176,7 +188,7 @@ def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None
             raise ValueError('Recipe symbols must match the run instruments')
         trace_points = [] if retain_trace else None
         trace = trace_points.append if retain_trace else None
-        controller = MomentumStrategy(recipe, observations, trace)
+        controller = MomentumStrategy(recipe, observations, trace, excluded_symbols=excluded_symbols, excluded_horizons=excluded_horizons)
         if retain_trace:
             attachments['calculation-trace.jsonl'] = lambda: ''.join(_json(asdict(point))+'\n' for point in trace_points).encode()
         definition = dict(kind='configured-momentum-recipe', name=recipe.name,
@@ -190,8 +202,10 @@ def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None
                             annualisation_hours=recipe.annualisation_hours,benchmark_weights=recipe.weight_caps,
                             expected_data_id=source.data_id,strategy_controller=controller,
                             fixed_reference_weights=fixed_reference_weights,
-                            signal_trace=trace_points,retain_diagnostics=retain_trace,
+                            signal_trace=trace_points,retain_diagnostics=retain_trace,execution_delay_bars=execution_delay_bars,
                             report_context=dict(report_context or {},pinned_recipe=asdict(recipe),
+                                                interventions=dict(excluded_symbols=sorted(excluded_symbols),excluded_horizons=sorted(excluded_horizons),
+                                                    asset_budget_policy='retain_original_budgets_cash',horizon_weight_policy='retain_original_weights'),
                                                 disabled_adjustments={name:getattr(recipe,name) for name in ('iv_mode','regime_mode','breaker_mode')},
                                                 warmup=dict(required_bars=recipe.warmup_bars,
                                                             policy='Recipe startup policy; not a statistical sufficiency claim')))
@@ -211,10 +225,21 @@ def main(argv=None):
         momentum.add_argument('--' + name,required=True)
     momentum.add_argument('--auxiliary')
     momentum.add_argument('--trace',action='store_true')
+    compare = actions.add_parser('compare', help='Run a bounded declared robustness plan')
+    for name in ('snapshot','spec','recipe','cases','output'):
+        compare.add_argument('--'+name, required=True)
+    compare.add_argument('--auxiliary')
+    compare.add_argument('--trace', action='store_true')
     for command in (run,momentum):
         command.add_argument('--report-config',help='JSON: fixed_reference_weights, optional research_record and report_context; declared before evaluation')
     args = parser.parse_args(argv)
-    if args.action == 'qualify':
+    if args.action == 'compare':
+        from .robustness import run_robustness
+        comparison = run_robustness(args.snapshot,args.spec,args.recipe,args.cases,args.output,
+                                    auxiliary_path=args.auxiliary,retain_trace=args.trace)
+        print(json.dumps(dict(directory=args.output,cases=len(comparison['cases']),
+                              succeeded=sum(r['status']=='succeeded' for r in comparison['cases']))))
+    elif args.action == 'qualify':
         source = qualify_price_bars(args.input, args.output)
         print(json.dumps(dict(directory=str(source.directory), data_id=source.data_id)))
     else:

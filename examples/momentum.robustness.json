@@ -1,0 +1,98 @@
+{
+  "schema": "momentum-robustness-v1",
+  "name": "btc-eth-sol-spot-robustness-v1",
+  "hypothesis": "Measure sensitivity of the frozen approved research baseline to declared costs, one-bar delay and individual asset/horizon exclusions. Retain every case; no selection or optimisation.",
+  "asset_budget_policy": "retain_original_budgets_cash",
+  "horizon_weight_policy": "retain_original_weights",
+  "cases": [
+    {
+      "id": "baseline"
+    },
+    {
+      "id": "zero-cost",
+      "fee_multiplier": "0",
+      "slippage_multiplier": "0"
+    },
+    {
+      "id": "double-cost",
+      "fee_multiplier": "2",
+      "slippage_multiplier": "2"
+    },
+    {
+      "id": "delay-one-bar",
+      "execution_delay_bars": 1
+    },
+    {
+      "id": "without-btc",
+      "excluded_symbols": [
+        "BTCUSDT"
+      ]
+    },
+    {
+      "id": "without-eth",
+      "excluded_symbols": [
+        "ETHUSDT"
+      ]
+    },
+    {
+      "id": "without-sol",
+      "excluded_symbols": [
+        "SOLUSDT"
+      ]
+    },
+    {
+      "id": "without-4-16",
+      "excluded_horizons": [
+        [
+          4,
+          16
+        ]
+      ]
+    },
+    {
+      "id": "without-8-32",
+      "excluded_horizons": [
+        [
+          8,
+          32
+        ]
+      ]
+    },
+    {
+      "id": "without-16-64",
+      "excluded_horizons": [
+        [
+          16,
+          64
+        ]
+      ]
+    },
+    {
+      "id": "without-32-128",
+      "excluded_horizons": [
+        [
+          32,
+          128
+        ]
+      ]
+    },
+    {
+      "id": "without-64-256",
+      "excluded_horizons": [
+        [
+          64,
+          256
+        ]
+      ]
+    },
+    {
+      "id": "without-128-512",
+      "excluded_horizons": [
+        [
+          128,
+          512
+        ]
+      ]
+    }
+  ]
+}
