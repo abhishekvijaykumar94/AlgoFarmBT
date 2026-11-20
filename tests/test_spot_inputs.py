@@ -203,6 +203,13 @@ class SpotInputTests(unittest.TestCase):
         report=decode(json.loads((first/'report.json').read_text()))
         self.assertEqual(report['total_fees'],result.total_fees)
         self.assertEqual(report['fill_count'],len(result.fills))
+        research=decode(json.loads((first/'research.json').read_text()))
+        self.assertEqual(research['performance']['bar_statistics'],report)
+        self.assertEqual(research['run_details']['context']['pinned_recipe']['name'],selected.name)
+        self.assertEqual(research['run_details']['context']['warmup']['required_bars'],512)
+        self.assertEqual(research['run_details']['context']['coverage']['available_pre_run_bars'],512)
+        self.assertEqual(research['run_details']['context']['disabled_adjustments']['iv_mode'],'disabled_ablation')
+        self.assertEqual(research['run_details']['reconciliation']['status'],'passed')
         strict=asdict(selected)
         strict['iv_mode']='iv_over_realised'
         strict['auxiliary_rules']=[dict(field='iv',source_id='required-iv',max_age_seconds=3600)]
@@ -210,6 +217,50 @@ class SpotInputTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Missing or stale'):
             run_momentum(self.output,config_path,recipe_path,self.root/'strict-missing-iv')
         self.assertFalse((self.root/'strict-missing-iv').exists())
+
+    def test_daily_decision_views_fixed_reference_and_pinned_research_context(self):
+        from algoFarmBT.backtests.execute_momentum_backtest import run_snapshot
+        source=qualify_price_bars(self.root,self.output)
+        symbols=[e['symbol'] for e in source.manifest['entries']]
+        config=dict(start=(T+16*H).isoformat(),end=(T+72*H).isoformat(),interval_seconds=3600,
+                    initial_cash='1000',cash_quantum='.01',quote_currency='USDT',
+                    execution_profile='research_bar_next_open_v1',assumptions=['Synthetic fixture rules'],
+                    rules=[dict(symbol=s,lot_size='.001',tick_size='.01',min_notional='0',
+                                fee_rate='0',fixed_fee='1',slippage_bps='0') for s in symbols])
+        config_path,targets_path=self.root/'run.json',self.root/'targets.json'
+        config_path.write_text(json.dumps(config))
+        targets_path.write_text(json.dumps([dict(time=config['start'],weights={symbols[0]:'.1'})]))
+        first,second=self.root/'daily-1',self.root/'daily-2'
+        options=dict(fixed_reference_weights={s:'.1' for s in symbols},
+                     report_context={'research_record':{'designation':'development','hypotheses':['Synthetic fixture'],
+                                     'related_runs':['fixture-parent'],'parameter_changes':['Declared .1 risky weights']}})
+        result=run_snapshot(self.output,config_path,targets_path,first,**options)
+        run_snapshot(self.output,config_path,targets_path,second,**options)
+        self.assertEqual((first/'manifest.sha256').read_bytes(),(second/'manifest.sha256').read_bytes())
+        research=decode(json.loads((first/'research.json').read_text()))
+        self.assertEqual(research['performance']['daily_risk']['complete_day_count'],2)
+        self.assertEqual(research['performance']['daily_risk']['risk_sample_start'],T+24*H)
+        self.assertEqual(research['performance']['daily_risk']['risk_sample_end'],T+72*H)
+        self.assertEqual(research['performance']['daily_risk']['excluded_period_net_pnl'],result.equity[8].equity-result.spec.initial_cash)
+        self.assertEqual(research['summary']['sample']['partial_day_count'],1)
+        self.assertEqual(research['research_record']['designation'],'development')
+        self.assertEqual(research['research_record']['prior_trial_history'],'unknown; not inferred from saved runs')
+        self.assertEqual(research['run_details']['checks']['input_integrity']['status'],'verified')
+        self.assertEqual(research['run_details']['checks']['artifact_integrity']['status'],'published_after_export')
+        self.assertEqual(len(research['summary']['comparison']),4)
+        comparison={r['series']:r for r in research['summary']['comparison']}
+        self.assertEqual(comparison['cash']['net_pnl'],0)
+        self.assertEqual(comparison['fixed_reference']['total_fees'],3)
+        benchmarks=decode(json.loads((first/'benchmarks.json').read_text()))
+        self.assertEqual(benchmarks['definitions']['fixed_reference']['cash_weight'],Decimal('.7'))
+        from openpyxl import load_workbook
+        workbook=load_workbook(first/'report.xlsx')
+        self.assertEqual(len(workbook['Summary']._charts[0].series),4)
+        rows={r[0].value:r[1].value for r in workbook['Performance'].iter_rows(min_row=2)}
+        self.assertEqual(rows['daily_risk.complete_day_count'],2)
+        self.assertEqual(rows['daily_risk.expected_shortfall_95'],'N/A')
+        self.assertEqual(rows['daily_risk.risk_sample_start'],(T+24*H).replace(tzinfo=None))
+        workbook.close()
 
 
 if __name__ == '__main__':

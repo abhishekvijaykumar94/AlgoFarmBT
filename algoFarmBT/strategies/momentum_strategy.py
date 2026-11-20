@@ -202,6 +202,21 @@ class _AuxiliaryBook:
 
 
 @dataclass(frozen=True)
+class HorizonPoint:
+    """Forecast attribution at its owning calculation, before any allocation."""
+    fast_span: int
+    slow_span: int
+    weight: Decimal
+    raw: Decimal
+    normalised: Decimal
+    clipped: Decimal
+    smoothed: Decimal
+    weighted: Decimal
+    clip_low_binding: bool
+    clip_high_binding: bool
+
+
+@dataclass(frozen=True)
 class MomentumPoint:
     time: object
     symbol: str
@@ -215,11 +230,24 @@ class MomentumPoint:
     breaker_multiplier: Decimal
     target_weight: Decimal
     auxiliary: tuple
+    horizons: tuple
+    hourly_volatility_before_floor: Decimal
+    volatility_floor: Decimal
+    volatility_floor_binding: bool
+    forecast_long_only_binding: bool
+    uncapped_weight: Decimal
+    budget: Decimal
+    cap: Decimal
+    cap_binding: bool
+    budget_binding: bool
+    weight_precision_binding: bool
+    warmup_binding: bool
 
 
 class _State:
-    def __init__(self, recipe):
+    def __init__(self, recipe, capture=False):
         self.recipe = recipe
+        self.capture = capture
         self.emas = {span: ExponentialMovingAverage(span, adjust=False, min_periods=1) for fast, slow, _ in recipe.horizons for span in (fast, slow)}
         self.signals = [ExponentialMovingAverage(recipe.signal_span, adjust=False, min_periods=1) if recipe.signal_span else None for _ in recipe.horizons]
         self.smoothed = [ExponentialMovingAverage(recipe.smoothing_span, adjust=False, min_periods=1) for _ in recipe.horizons]
@@ -245,7 +273,9 @@ class _State:
         else:
             vol = r.rv_fast_weight * variances[0].sqrt() + (1 - r.rv_fast_weight) * variances[1].sqrt()
         annualiser = Decimal(r.annualisation_hours).sqrt()
-        vol = max(vol, r.annual_volatility_floor / annualiser)
+        before_floor = vol
+        floor = r.annual_volatility_floor / annualiser
+        vol = max(vol, floor)
         annual_vol = vol * annualiser
         inputs = tuple(book.get(bar.symbol, field, bar.end) for field in sorted(book.rules))
         by_field = {v.field: v.value for v in inputs}
@@ -259,22 +289,32 @@ class _State:
         if regime < 0 or not 0 <= breaker <= 1:
             raise ValueError('Regime must be nonnegative and breaker between zero and one')
         denominator = bar.close * (vol if r.normalisation == 'price_hourly_volatility' else annual_vol)
-        forecasts = []
+        forecasts, horizon_points = [], []
         for i, (fast, slow, _) in enumerate(r.horizons):
             macd = values[fast] - values[slow]
             histogram = macd - self.signals[i].update(macd) if self.signals[i] else macd
             normalised = histogram / denominator * iv_multiplier
             clipped = min(r.forecast_clip, max(-r.forecast_clip, normalised))
             forecasts.append(self.smoothed[i].update(clipped))
+            if self.capture:
+                horizon_points.append(HorizonPoint(fast, slow, r.horizons[i][2], histogram, normalised,
+                    clipped, forecasts[-1], forecasts[-1] * r.horizons[i][2],
+                    normalised < -r.forecast_clip, normalised > r.forecast_clip))
         forecast = sum((v * w for v, (_, _, w) in zip(forecasts, r.horizons)), Decimal(0))
         budget, cap = dict(r.symbol_budgets)[bar.symbol], dict(r.weight_caps)[bar.symbol]
-        weight = min(cap, budget * max(Decimal(0), forecast) * r.vol_target / annual_vol * regime * breaker)
+        uncapped_weight = budget * max(Decimal(0), forecast) * r.vol_target / annual_vol * regime * breaker
+        weight = min(cap, uncapped_weight)
+        before_precision = weight
         # Weights use 24 decimal places, rounded down at the simulator
         # interface so numerical rounding cannot exceed a cap.
         weight = weight.quantize(Decimal('1e-24'), rounding=ROUND_DOWN)
         ready = self.count >= r.warmup_bars
         return MomentumPoint(bar.end, bar.symbol, ready, tuple(forecasts), forecast, vol, annual_vol,
-                             iv_multiplier, regime, breaker, weight if ready else Decimal(0), inputs)
+                             iv_multiplier, regime, breaker, weight if ready else Decimal(0), inputs,
+                             tuple(horizon_points), before_floor, floor, before_floor < floor,
+                             forecast < 0, uncapped_weight, budget, cap, uncapped_weight > cap,
+                             cap == budget and uncapped_weight > budget,
+                             weight != before_precision, not ready)
 
 
 class MomentumStrategy(CoreTradingStrategy):
@@ -302,7 +342,7 @@ class MomentumStrategy(CoreTradingStrategy):
             raise ValueError('Momentum run needs complete hourly intervals')
         with localcontext() as context:
             context.prec = 50
-            self._states = states = {symbol: _State(recipe) for symbol, _ in recipe.symbol_budgets}
+            self._states = states = {symbol: _State(recipe, trace is not None) for symbol, _ in recipe.symbol_budgets}
             self._book = book = _AuxiliaryBook(auxiliary, recipe)
         previous, began = None, False
         for timestamp, rows in groupby(chain.from_iterable(source), key=lambda b: b.start):
