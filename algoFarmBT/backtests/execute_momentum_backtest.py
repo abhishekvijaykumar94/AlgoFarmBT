@@ -63,7 +63,7 @@ def resolve_run_spec(raw, data_id, code_id):
 def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
                  attachments=None, annualisation_hours=None, benchmark_weights=None, expected_data_id=None, strategy_controller=None,
                  fixed_reference_weights=None, report_context=None, signal_trace=None, retain_diagnostics=False,
-                 execution_delay_bars=0):
+                 execution_delay_bars=0, liquidity_path=None, liquidity_policy=None):
     destination = Path(destination)
     if destination.exists():
         raise FileExistsError(destination)
@@ -72,6 +72,12 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
         raise ValueError('Snapshot changed after target preparation')
     code_id, code_files = source_snapshot()
     spec, seconds = resolve_run_spec(json.loads(Path(config).read_text()),source.data_id,code_id)
+    liquidity=None
+    if (liquidity_path is None)!=(liquidity_policy is None):
+        raise ValueError('Liquidity snapshot and policy are required together')
+    if liquidity_path is not None:
+        from ..liquidity_inputs import load_liquidity
+        liquidity=load_liquidity(liquidity_path,source,liquidity_policy)
     # References are declared before evaluating any strategy returns.
     with localcontext() as decimal_context:
         decimal_context.prec=28
@@ -80,18 +86,18 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
     fixed_reference_weights=dict(fixed_reference_weights) if fixed_reference_weights is not None else None
     context=dict(report_context or {})
     if strategy_controller is not None:
-        backtest = Backtest.from_prepared(spec, source, strategy=strategy_controller, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars)
+        backtest = Backtest.from_prepared(spec, source, strategy=strategy_controller, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars, liquidity=liquidity)
         result = backtest.run()
         rows = [dict(time=t.time.isoformat(),weights={s:str(w) for s,w in t.weights},rebalance=t.rebalance) for t in backtest.target_log]
         targets_raw = json.dumps(rows,sort_keys=True,separators=(',',':')).encode()
     else:
         targets_raw = Path(targets_path).read_bytes()
         targets = [SpotTarget(**t) for t in json.loads(targets_raw)]
-        backtest = Backtest.from_prepared(spec, source, targets=targets, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars)
+        backtest = Backtest.from_prepared(spec, source, targets=targets, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars, liquidity=liquidity)
         result = backtest.run()
     report = backtest.performance_report()
     benchmarks = spot_benchmarks(spec, source, benchmark_weights, annualisation_hours,
-                                 fixed_reference_weights=fixed_reference_weights)
+                                 fixed_reference_weights=fixed_reference_weights,liquidity=liquidity)
     if source_snapshot()[0] != code_id:
         raise ValueError('Source code changed during the run')
     body = asdict(result)
@@ -121,6 +127,8 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
                        evidence='manifest.json contains SHA256 of each exported artifact; manifest.sha256 pins that manifest. No report self-hash is embedded.'),
                    benchmark_declaration=dict(buy_and_hold=benchmark_weights,fixed_reference=fixed_reference_weights,
                                                policy=benchmarks['policy']))
+    if liquidity is not None:
+        context['liquidity']=dict(data_id=liquidity.data_id,policy=asdict(liquidity.policy),evidence=liquidity.evidence)
     sections=backtest.report_sections(signal_trace=signal_trace)
     research=backtest.research_report(context=context,benchmarks=benchmarks,sections=sections)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +171,7 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
 
 def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None, retain_trace=False, *,
                  fixed_reference_weights=None, report_context=None, execution_delay_bars=0,
-                 excluded_symbols=(), excluded_horizons=()):
+                 excluded_symbols=(), excluded_horizons=(), liquidity_path=None, liquidity_policy=None):
     """Prepare a fully configured recipe, then replay its known-at targets."""
     from ..strategies.momentum_strategy import AuxiliaryObservation, MomentumStrategy, load_recipe
     if Path(destination).exists():
@@ -202,6 +210,7 @@ def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None
                             annualisation_hours=recipe.annualisation_hours,benchmark_weights=recipe.weight_caps,
                             expected_data_id=source.data_id,strategy_controller=controller,
                             fixed_reference_weights=fixed_reference_weights,
+                            liquidity_path=liquidity_path,liquidity_policy=liquidity_policy,
                             signal_trace=trace_points,retain_diagnostics=retain_trace,execution_delay_bars=execution_delay_bars,
                             report_context=dict(report_context or {},pinned_recipe=asdict(recipe),
                                                 interventions=dict(excluded_symbols=sorted(excluded_symbols),excluded_horizons=sorted(excluded_horizons),
@@ -217,6 +226,10 @@ def main(argv=None):
     qualify = actions.add_parser('qualify')
     qualify.add_argument('--input', required=True)
     qualify.add_argument('--output', required=True)
+    liquidity = actions.add_parser('qualify-liquidity',help='Qualify saved bar volumes separately from prices')
+    for name in ('input','snapshot','output'):
+        liquidity.add_argument('--'+name,required=True)
+    liquidity.add_argument('--availability-lag-seconds',type=int,required=True)
     run = actions.add_parser('run')
     for name in ('snapshot', 'spec', 'targets', 'output'):
         run.add_argument('--' + name, required=True)
@@ -231,9 +244,31 @@ def main(argv=None):
     compare.add_argument('--auxiliary')
     compare.add_argument('--trace', action='store_true')
     for command in (run,momentum):
+        command.add_argument('--liquidity')
+        command.add_argument('--liquidity-policy',help='JSON policy: max_participation, impact_coefficient_bps, max_age_seconds')
         command.add_argument('--report-config',help='JSON: fixed_reference_weights, optional research_record and report_context; declared before evaluation')
+    validate = actions.add_parser('validate',help='Run frozen chronological validation folds')
+    for name in ('snapshot','spec','recipe','plan','output'):
+        validate.add_argument('--'+name,required=True)
+    validate.add_argument('--auxiliary')
+    capacity = actions.add_parser('capacity',help='Actual capital-size reruns with qualified bar liquidity')
+    for name in ('snapshot','liquidity','spec','recipe','plan','output'):
+        capacity.add_argument('--'+name,required=True)
+    capacity.add_argument('--auxiliary')
     args = parser.parse_args(argv)
-    if args.action == 'compare':
+    if args.action == 'capacity':
+        from .capacity import run_capacity
+        result=run_capacity(args.snapshot,args.liquidity,args.spec,args.recipe,args.plan,args.output,auxiliary_path=args.auxiliary)
+        print(json.dumps(dict(directory=args.output,cases=len(result['cases']),status=result['capacity_status'])))
+    elif args.action == 'qualify-liquidity':
+        from ..liquidity_inputs import qualify_liquidity
+        path=qualify_liquidity(args.input,args.snapshot,args.output,availability_lag_seconds=args.availability_lag_seconds)
+        print(json.dumps(dict(directory=str(path))))
+    elif args.action == 'validate':
+        from .validation import run_validation
+        result=run_validation(args.snapshot,args.spec,args.recipe,args.plan,args.output,auxiliary_path=args.auxiliary)
+        print(json.dumps(dict(directory=args.output,folds=len(result['folds']))))
+    elif args.action == 'compare':
         from .robustness import run_robustness
         comparison = run_robustness(args.snapshot,args.spec,args.recipe,args.cases,args.output,
                                     auxiliary_path=args.auxiliary,retain_trace=args.trace)
@@ -249,7 +284,8 @@ def main(argv=None):
         context=dict(options.get('report_context',{}))
         if 'research_record' in options:
             context['research_record']=options['research_record']
-        report_options=dict(fixed_reference_weights=options.get('fixed_reference_weights'),report_context=context)
+        report_options=dict(fixed_reference_weights=options.get('fixed_reference_weights'),report_context=context,
+                            liquidity_path=args.liquidity,liquidity_policy=json.loads(Path(args.liquidity_policy).read_text()) if args.liquidity_policy else None)
         if args.action == 'momentum':
             result = run_momentum(args.snapshot,args.spec,args.recipe,args.output,args.auxiliary,args.trace,**report_options)
             strategy = 'configured-momentum-recipe'

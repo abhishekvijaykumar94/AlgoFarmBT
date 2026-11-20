@@ -17,11 +17,11 @@ T = datetime(2026, 5, 1, tzinfo=timezone.utc)
 H = timedelta(hours=1)
 
 
-def make_inputs(root, trend=False):
+def make_inputs(root, trend=False, symbols=('BTCUSDT', 'ETHUSDT', 'SOLUSDT')):
     report = dict(kind='spot-archive-comparison', interval='1h', start=T.isoformat(),
                   end=(T + 744 * H).isoformat(), native_file='native.jsonl', comparisons=[])
     native = []
-    for ident, symbol in enumerate(('BTCUSDT', 'ETHUSDT', 'SOLUSDT'), 1):
+    for ident, symbol in enumerate(symbols, 1):
         stream = io.StringIO()
         writer = csv.writer(stream)
         for i in range(744):

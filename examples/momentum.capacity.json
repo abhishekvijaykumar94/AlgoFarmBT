@@ -1,0 +1,18 @@
+{
+  "schema": "momentum-capacity-v1",
+  "name": "btc-eth-sol-bar-volume-capital-scenarios-v1",
+  "hypothesis": "Declared capital sizes alter actual fills, participation, shortfalls and net results under a lagged volume scenario",
+  "policy": {
+    "max_participation": "0.01",
+    "impact_coefficient_bps": "100",
+    "max_age_seconds": 7200
+  },
+  "cases": [
+    {"id": "baseline", "initial_cash": "10000", "constrained": false},
+    {"id": "volume-10k", "initial_cash": "10000", "constrained": true},
+    {"id": "volume-100k", "initial_cash": "100000", "constrained": true},
+    {"id": "volume-1m", "initial_cash": "1000000", "constrained": true},
+    {"id": "volume-10m", "initial_cash": "10000000", "constrained": true},
+    {"id": "volume-100m", "initial_cash": "100000000", "constrained": true}
+  ]
+}

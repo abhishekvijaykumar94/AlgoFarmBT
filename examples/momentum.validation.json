@@ -1,0 +1,42 @@
+{
+  "schema": "chronological-validation-v1",
+  "name": "btc-eth-sol-development-folds-v1",
+  "hypothesis": "Exercise frozen chronological evaluation on previously inspected history; no new out-of-sample evidence is claimed.",
+  "capital_policy": "independent_reset_accounts",
+  "selection_rule": "frozen_recipe",
+  "recipe_sha256": "55cb8d933a3c694eb970ed01ee73f3d73bd3e1e2d36c6c1c74c56a418aee4f80",
+  "inspected_through": "2026-09-01T00:00:00Z",
+  "prior_trials": {
+    "status": "unknown"
+  },
+  "statistics": {
+    "seed": 604,
+    "block_days": 7,
+    "replications": 500,
+    "confidence": 0.95,
+    "iid_assumption": false,
+    "benchmark_annual_sharpe": "0"
+  },
+  "folds": [
+    {
+      "id": "development-one",
+      "designation": "development",
+      "development_start": "2026-03-01T00:00:00Z",
+      "development_end": "2026-09-01T00:00:00Z",
+      "calibration_end": "2026-09-01T00:00:00Z",
+      "selected_at": "2026-11-19T00:00:00Z",
+      "test_start": "2026-06-15T16:00:00Z",
+      "test_end": "2026-08-01T00:00:00Z"
+    },
+    {
+      "id": "development-two",
+      "designation": "development",
+      "development_start": "2026-03-01T00:00:00Z",
+      "development_end": "2026-09-01T00:00:00Z",
+      "calibration_end": "2026-09-01T00:00:00Z",
+      "selected_at": "2026-11-19T00:00:00Z",
+      "test_start": "2026-08-01T00:00:00Z",
+      "test_end": "2026-09-01T00:00:00Z"
+    }
+  ]
+}

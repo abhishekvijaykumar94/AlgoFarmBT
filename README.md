@@ -93,3 +93,13 @@ Delayed decisions retain known-at times and execute at the later bar open. Execu
 The output freezes common prices, plan, recipe and run configuration once, saves every case and its manifest/run ID (including a failure receipt when a case fails), and writes matching `comparison.json` and `comparison.xlsx`. Summary/Performance compare actual net results, risk, exposure, costs, turnover and execution effects, with relative links to each case report. Undefined values remain unavailable. A joint fee/slippage sign-change bracket uses observed rerun endpoints only; the separate same-fill fee diagnostic is not a zero-cost rerun. Marginal ablation differences are not additive P&L contributions.
 
 Replay using the archived `source.zip`, `common/prices`, `common/spec.json`, `common/recipe.json` and `common/plan.json` (plus `common/auxiliary.json` when present). Existing outputs are never overwritten. Price inputs are copied and verified before any case runs, and the suite manifest hashes every retained artifact. Results on previously inspected history remain development research.
+
+## Chronological validation
+
+The `validate` command runs declared frozen-recipe chronological folds using the existing backtest and related-run workflow. See [chronological validation](docs/chronological-validation.md) for the plan, reset-account policy, eligibility/inspection checks, statistical assumptions and replay. The included real-data example deliberately remains development research.
+
+Liquidity and actual capital-size reruns use the same Backtest and shared ledger.
+See [liquidity and capacity research](docs/liquidity-capacity.md) and the explicit
+[capital scenario plan](examples/momentum.capacity.json). Qualified bar volumes
+support a lagged-volume research scenario; unverified latency, spread/depth,
+fees/precision and impact calibration prevent certified capacity estimates.
