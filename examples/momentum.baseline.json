@@ -1,0 +1,40 @@
+{
+  "name": "btc-eth-sol-cash-spot-momentum-baseline-v1",
+  "histogram": "macd_histogram",
+  "signal_span": 9,
+  "smoothing_span": 6,
+  "ema_initialisation": "recursive_first_observation",
+  "return_kind": "log",
+  "rv_estimator": "ewma_zero_mean_variance",
+  "rv_blend": "variance",
+  "rv_fast_weight": "0.5",
+  "annualisation_hours": 8760,
+  "annual_volatility_floor": "0.10",
+  "normalisation": "price_hourly_volatility",
+  "iv_mode": "disabled_ablation",
+  "regime_mode": "disabled_ablation",
+  "breaker_mode": "disabled_ablation",
+  "auxiliary_rules": [],
+  "warmup_bars": 2560,
+  "symbol_budgets": {
+    "BTCUSDT": "0.3333333333333333333333333333",
+    "ETHUSDT": "0.3333333333333333333333333333",
+    "SOLUSDT": "0.3333333333333333333333333333"
+  },
+  "weight_caps": {
+    "BTCUSDT": "0.3333333333333333333333333333",
+    "ETHUSDT": "0.3333333333333333333333333333",
+    "SOLUSDT": "0.3333333333333333333333333333"
+  },
+  "allocation_policy": "long_only_budget_capped_no_redistribution",
+  "rebalance": true,
+  "assumptions": [
+    "Research baseline approved by the user on 19 November 2026; not an exact reproduction of the incomplete screenshot",
+    "MACD histogram uses a 9-hour signal EMA; each clipped horizon uses 6-hour EWMA smoothing",
+    "Annual volatility uses 8760 hours, a 50/50 variance blend, and a 10% floor",
+    "IV, regime and breaker are disabled explicitly for this ablation",
+    "Negative forecasts mean cash; no shorting or borrowing; equal capped asset budgets with unused capital in USDT",
+    "2560 complete pre-run hours are a declared startup policy, not a statistical sufficiency claim",
+    "Costs and exchange precision must be supplied separately as verified rules or explicit research assumptions"
+  ]
+}

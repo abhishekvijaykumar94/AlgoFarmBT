@@ -9,7 +9,7 @@ from algoFarmBT.indicators import SimpleMovingAverage, CrossoverIndicator
 class MovingAverageStrategy(libs.CoreTradingStrategy):
 
     def __init__(self, strat_name,short_window: int,long_window: int,backtest=False):
-        super().__init__(strat_name, backtest)
+        super().__init__(strat_name, backtest, long_window)
         self.short_ma = SimpleMovingAverage(short_window)
         self.long_ma = SimpleMovingAverage(long_window)
         self.crossover_indicator = CrossoverIndicator()

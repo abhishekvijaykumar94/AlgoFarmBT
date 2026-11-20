@@ -1,0 +1,21 @@
+{
+  "start": "2026-06-15T16:00:00Z",
+  "end": "2026-09-01T00:00:00Z",
+  "interval_seconds": 3600,
+  "initial_cash": "10000",
+  "cash_quantum": "0.01",
+  "quote_currency": "USDT",
+  "execution_profile": "research_bar_next_open_v1",
+  "assumptions": [
+    "PROPOSAL: research run configuration, pending strategy choices",
+    "First 2560 hours of the verified March-August snapshot provide warmup; remaining 1856 hours form the run",
+    "10 basis points fee and 5 basis points adverse slippage per side are research assumptions, not verified historical venue costs",
+    "A 0.01 price tick, 0.000001 quantity lot and 10 USDT minimum notional for each asset are synthetic research rules, not certified historical exchange precision",
+    "No borrowing or short selling; retained end positions are valued at the final completed close"
+  ],
+  "rules": [
+    {"symbol":"BTCUSDT","lot_size":"0.000001","tick_size":"0.01","min_notional":"10","fee_rate":"0.001","fixed_fee":"0","slippage_bps":"5"},
+    {"symbol":"ETHUSDT","lot_size":"0.000001","tick_size":"0.01","min_notional":"10","fee_rate":"0.001","fixed_fee":"0","slippage_bps":"5"},
+    {"symbol":"SOLUSDT","lot_size":"0.000001","tick_size":"0.01","min_notional":"10","fee_rate":"0.001","fixed_fee":"0","slippage_bps":"5"}
+  ]
+}

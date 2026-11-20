@@ -1,311 +1,67 @@
-# Backtesting Module
+# AlgoFarmBT
 
-The Backtesting module enables you to simulate trading strategies using historical market data. By replicating real trading conditions, it helps you evaluate the performance of trading strategies and fine-tune them for live trading. Below is a guide to creating a new backtest using this module.
+Backtesting application and native historical-data preparation. Install sibling `algoLibs` plus this project's requirements. Configure `MARKET_DATA_READ_URL` privately for hosted `historical_data`; the saved SSM connection uses local port 5433.
 
-## Overview
-To create a backtest, you need to:
-1. **Define a Strategy**: Implement a strategy class.
-2. **Define Indicators**: Implement indicator classes used by the strategy.
-3. **Execute the Backtest**: Create a script to set up and execute the backtest.
+## Inspect and prepare data
 
-This guide explains each step and references the provided files for illustration:
-- **Strategy Class**: `moving_average_strategy.py`
-- **Indicator Classes**: `crossover.py`, `moving_average.py`
-- **Execution Script**: `execute_moving_average_backtest.py`
+Run from this project:
 
----
-
-## 1. Defining a Strategy
-A strategy encapsulates the logic for generating trading signals based on specific conditions.
-
-### Example: Moving Average Strategy
-Refer to `moving_average_strategy.py`.
-
-```python
-
-
-from datetime import datetime
-from typing import Optional, List
-import algoLibs as libs
-import pandas as pd
-
-
-class MovingAverageStrategy(libs.CoreTradingStrategy):
-
-    def __init__(self, strat_name,short_window: int,long_window: int,backtest=False):
-        super().__init__(strat_name, backtest)
-        self.short_ma = libs.SimpleMovingAverage(short_window)
-        self.long_ma = libs.SimpleMovingAverage(long_window)
-        self.crossover_indicator = libs.CrossoverIndicator()
-        self.indicators = [self.short_ma, self.long_ma]
-
-    def apply_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
-        # Ensure the DataFrame is sorted by ticker and time
-        data.sort_values([libs.TickMarketFeedColumns.tag, libs.TickMarketFeedColumns.time], inplace=True)
-        data.reset_index(drop=True, inplace=True)
-
-        data[self.crossover_indicator.name] = None
-
-        # Get the unique tickers
-        tickers = data[libs.TickMarketFeedColumns.tag].unique()
-
-        for ticker in tickers:
-            # Create a boolean mask for this ticker
-            ticker_mask = data[libs.TickMarketFeedColumns.tag] == ticker
-
-            # Slice the DataFrame using the mask
-            ticker_data = data.loc[ticker_mask]
-
-            # Calculate indicators for this ticker
-            short_ma_values = self.short_ma.calculate(ticker_data, columns=[libs.TickMarketFeedColumns.last_traded_price])
-            long_ma_values = self.long_ma.calculate(ticker_data, columns=[libs.TickMarketFeedColumns.last_traded_price])
-            crossover_signals = self.crossover_indicator.calculate(short_ma_values, long_ma_values)
-
-            data.loc[ticker_mask, self.crossover_indicator.name] = crossover_signals.values
-
-        return data.dropna()
-
-    def get_signal(self, quote, index, transaction_type: libs.TransactionType):
-        if self.backtest:
-            timestamp = quote.get(libs.TickMarketFeedColumns.time,0)
-            time = timestamp.to_pydatetime().strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            time = str(datetime.now())
-
-        signal_id = int(datetime.now().timestamp() * 1000000)
-        signal = libs.Signal(
-            _message_type="PLACE_ORDER_MESSAGE",
-            trading_symbol=quote.get(libs.TickMarketFeedColumns.tag,0),
-            transaction_type=transaction_type,
-            token=quote.get(libs.TickMarketFeedColumns.token,0),
-            ordertype="MARKET",
-            duration="DAY",
-            quantity=0,  # Quantity will be determined in Portfolio
-            signal_time=time,
-            signal_id=signal_id,
-            strategy_id=self.strat_name
-        )
-        return signal
-
-    def generate_signal(self, quotes: pd.DataFrame) -> List[Optional[libs.Signal]]:
-        """
-        Generates signals for multiple rows of quotes in a vectorized manner.
-
-        Args:
-        - quotes (pd.DataFrame): DataFrame containing multiple rows of price data.
-
-        Returns:
-        - List[Optional[Signal]]: List of generated signals (either LONG, SHORT, or None).
-        """
-        signals = []
-
-        # Apply the indicator logic in a vectorized manner
-        crossover_values = quotes[self.crossover_indicator.name].fillna(0)
-
-        # Iterate through the DataFrame rows and generate signals
-        for index, crossover_value in zip(quotes.index, crossover_values):
-            if crossover_value == 2:
-                # Bullish crossover - potential LONG signal
-                signal = self.get_signal(quotes.loc[index], index, libs.TransactionType.LONG)
-                signals.append(signal)
-            elif crossover_value == -2:
-                # Bearish crossover - potential SHORT signal
-                signal = self.get_signal(quotes.loc[index],index, libs.TransactionType.SHORT)
-                signals.append(signal)
-
-        return signals
-        
-        
+```sh
+python -m algoFarmBT.data catalog
+python -m algoFarmBT.data read --request request.json
+python -m algoFarmBT.data prepare --request request.json --output /new/snapshot
+python -m algoFarmBT.data read --request request.json --snapshot /new/snapshot
 ```
 
-### Key Functions
-- **`__init__(self, params)`**:
-  Initializes the strategy with parameters like moving average window sizes or thresholds.
-- **`generate_signals(self, data)`**:
-  Processes historical data to generate buy/sell signals.
-  - **Input**: Historical market data.
-  - **Output**: A list of signals (buy, sell, or hold).
-- **`evaluate_performance(self, trades)`**:
-  Evaluates the strategy’s performance based on simulated trades.
+Example `request.json`:
 
-### Customization
-Create a new strategy by subclassing the base strategy class and overriding the methods above. Ensure your strategy handles:
-- Entry and exit conditions.
-- Risk management.
-
----
-
-## 2. Defining Indicators
-Indicators are reusable components used by strategies to analyze market data.
-
-### Example: Crossover Indicator
-Refer to `crossover.py`.
-
-```python
-
-import pandas as pd
-import algoLibs as libs
-
-class CrossoverIndicator(libs.BaseIndicator):
-
-    def __init__(self):
-        """
-        Initialize the CrossoverIndicator.
-        """
-        super().__init__(period=None, name="crossover")  # Period is not applicable for crossover
-
-    def calculate(self, series1: pd.DataFrame, series2: pd.DataFrame) -> pd.Series:
-        """
-        Calculate the crossover signals between two time series.
-
-        :param series1: First time series as a pandas DataFrame (single column expected).
-        :param series2: Second time series as a pandas DataFrame (single column expected).
-        :return: pandas Series with crossover signals.
-        """
-        # Extract the first column from each DataFrame
-        series1 = series1.iloc[:, 0]
-        series2 = series2.iloc[:, 0]
-
-        # Ensure the series are aligned, preserving the index and filling with NaN for missing values
-        series1, series2 = series1.align(series2, join='outer')
-
-        # Generate signals
-        signal = (series1 > series2).astype(float) - (series1 < series2).astype(float)
-
-        # Set signal to NaN where either series1 or series2 is NaN
-        signal[series1.isna() | series2.isna()] = float('nan')
-
-        # Calculate crossover
-        crossover = signal.diff()
-
-        # Set crossover to NaN where either series1 or series2 is NaN
-        crossover[series1.isna() | series2.isna()] = float('nan')
-
-        crossover.name = "crossover"
-
-        return crossover
-
-    def __str__(self):
-        return "Crossover"
-
-
+```json
+{"dataset":"public.md_bar","start":"2026-09-04T00:00:00Z","end":"2026-09-04T01:00:00Z","filters":{"instrument_id":1,"venue_id":1,"interval":"1m","bar_type":"trade"},"batch_size":1000}
 ```
 
-### Example: Moving Average Indicator
-Refer to `moving_average.py`.
+All hosted table/view families retain native fields. JSON output tags Decimal and UTC values to preserve precision. Reference tables omit time bounds. Prepared exports freeze full rows and instrument/source metadata; offline reads verify hashes. See [shared data documentation](../algoLibs/algoLibs/market_data/README.md) for semantics, coverage limits and explicit write migrations.
 
-```python
+## Prepared cash-spot research
 
-import pandas as pd
-import algoLibs as libs
+The prepared runner supports a single quote-currency account with long-only fractional spot holdings, sparse desired portfolio weights, explicit costs and a complete fill/accounting history. Use `Backtest.from_prepared(spec, source, strategy=MomentumStrategy(recipe)).run()` or `Backtest.run_prepared(spec, source, targets)`. These extend the existing `Backtest` runner and `BacktestPortfolio`: all fills are existing `Trade` objects posted through `Portfolio.update_holdings`, and positions are existing `Holding` objects. The prepared-bar profile adds chronology, target sizing and spot precision rules to those classes; there is no separate simulator or account ledger. Hosted/live clients are unnecessary for offline runs.
 
-# Moving Average base class
-class MovingAverage(libs.BaseIndicator):
+`research_bar_next_open_v1` publishes the preceding completed bar at boundary T, accepts a target known at T, then executes at the open at T under an explicit zero-latency, unconstrained-liquidity approximation. Future close/volume values cannot affect that opening fill. Quantities use integer lots; adverse prices respect ticks; buy notionals and fees round up to currency precision, sell proceeds round down. Targets share predecision equity, reductions precede increases, and fee-inclusive buy budgets are scaled together when cash is insufficient. Repeated weights do not add exposure; omitted symbols retain holdings. Set `rebalance: true` to request adjustment at an unchanged weight. End positions remain open and marked.
 
-    def __init__(self, period: int, name):
-        super().__init__(period, name=name)
+Qualify archived database extractions offline, then run supplied targets:
 
-    def __str__(self):
-        return f"MA_{self.period}"
-
-# Simple Moving Average (SMA)
-class SimpleMovingAverage(MovingAverage):
-
-    def __init__(self, period: int):
-        super().__init__(period, name="simpleMovingAverage")
-
-    def calculate(self, data: pd.DataFrame, columns=None):
-        result = pd.DataFrame(index=data.index)  # Preserve the original index
-        columns = columns if columns else data.columns
-
-        for column in columns:
-            result[column + f"_{self.period}SMA"] = data[column].rolling(window=self.period, min_periods=self.period).mean()
-
-        return result
-
+```sh
+python -m algoFarmBT.backtests.execute_momentum_backtest qualify --input comparison-directory --output new-prices
+python -m algoFarmBT.backtests.execute_momentum_backtest run --snapshot new-prices --spec run.json --targets targets.json --output new-result
 ```
 
-### Key Functions
-- **`__init__(self, short_window, long_window)`**:
-  Initializes the crossover indicator with short and long moving average window sizes.
-- **`calculate(self, data)`**:
-  Computes the crossover points between short and long moving averages.
-  - **Input**: Historical market data.
-  - **Output**: Crossover signals (e.g., bullish or bearish).
+Qualification requires a hashed native extraction, original Binance spot monthly hourly archives and published checksums. It compares timestamp, identity and selected native fields exactly. Quote-volume discrepancies are recorded and excluded; exported observations contain opening and closing prices only. No hosted repair occurs. Reader hashes and full hourly coverage are checked, with no forward filling. The CLI saves the resolved configuration, targets, fills, orders/rejections, cost basis, equity, source/code hashes and environment versions in a new result directory.
 
-### Customization
-Create new indicators by subclassing the base indicator class and implementing the required logic in the `calculate` function.
+`run.json` supplies `start`, `end`, `interval_seconds`, `initial_cash`, `cash_quantum`, `quote_currency`, `assumptions`, `execution_profile`, and `rules`. Each rule supplies `symbol`, `lot_size`, `tick_size`, `min_notional`, `fee_rate`, `fixed_fee` and `slippage_bps` as decimal strings. Targets are a JSON list of objects such as `{"time":"2026-08-01T00:00:00Z","weights":{"BTCUSDT":"0.2","ETHUSDT":"0.2","SOLUSDT":"0.2"}}`. Every cost and precision assumption must be supplied. Data and code identities are resolved from actual files.
 
----
+The momentum command instantiates `MomentumStrategy(CoreTradingStrategy)` in the existing strategies package. Its `apply_indicators` and `generate_signal` hooks use the shared EMA indicator and emit target weights into the existing backtest/portfolio lifecycle:
 
-## 3. Executing the Backtest
-The execution script sets up the environment, queries historical data from InfluxDB, and runs the backtest.
-
-### Example: Execute Moving Average Backtest
-Refer to `execute_moving_average_backtest.py`.
-
-```python
- 	
-from datetime import datetime
-import algoLibs as libs
-from algoFarmBT.strategies import MovingAverageStrategy
-
-
-# Initialise date and tenor related objects
-start_date = start_time = datetime(2024, 6, 3, 0, 0, 0)
-end_date = datetime(2024, 6, 10, 0, 0, 0)
-calendar = Calendar('/Users/abhishekvijaykumar/PycharmProjects/AlgoFarmPlus/AlgoLibs/data/Holidays.xlsx')
-tenor = Tenor(RollRule.MODFOLLOW, calendar)
-
-# Set list of tickers that can be used to query the DB
-tickers = ["AXISBANK-EQ", "APOLLOTYRE-EQ", "SBIN-EQ", "CIPLA-EQ", "POWERGRID-EQ"]
-
-# Add strategy related objects
-capital = 100000.0
-short_window = 20
-long_window = 50
-data_frequency = "5m"
-moving_average_startegy = MovingAverageStrategy('MovingAverageStrategy', short_window, long_window)
-allocation_strategy = NaiveAllocationStrategy(capital, 1000.0, 5)
-angelBroking = AngelBrokingBrokerage()
-
-backtest = Backtest(
-    tickers=tickers,
-    start_date=start_date,
-    end_date=end_date,
-    data_frequency=data_frequency,
-    batch_frequency="1d",
-    strategy=moving_average_startegy,
-    capital=capital,
-    allocation_strategy=allocation_strategy,
-    broker=angelBroking,
-    tenor=tenor,
-    last_n_points=long_window - 1
-)
-
-backtest.run()
-backtest.generate_report('/Users/abhishekvijaykumar/PycharmProjects/AlgoFarmPlus/reports/')
-
+```sh
+python -m algoFarmBT.backtests.execute_momentum_backtest momentum --snapshot prices --spec run.json --recipe recipe.json --output new-result --trace
 ```
 
-### Key Components
-- **Querying Historical Data**:
-  The backtest module fetches historical data directly from InfluxDB. Users only need to specify:
-  - The tickers to query.
-  - The start and end dates for the backtest.
-  - The time frequency (e.g., daily, hourly).
-- **Setting Up the Strategy**:
-  Instantiate the strategy with necessary parameters.
-- **Running the Backtest**:
-  Pass the queried data and strategy to the backtesting engine.
-- **Evaluating Performance**:
-  Analyze results to evaluate performance.
+The known six horizons, their weights, the 0.50 volatility target and ±2 clipping are recorded defaults. Every unspecified formula is a required recipe choice: histogram/signal span, recursive EMA initialisation, return and volatility estimator, blend, annualisation, normalisation units, smoothing, volatility floor, warmup, IV/risk inputs, budgets/caps and rebalancing. State persists across batches. Forecasts never use full-sample calibration. Weight intents round down to 24 decimal places before entering the simulator.
 
----
+Enabled IV, regime or circuit-breaker inputs require `--auxiliary observations.json`, containing `symbol`, `field`, `observed_at`, `available_at`, `value`, `units` and `source_id`. Values join backward by availability; later arrivals of older observations do not replace newer state. IV units must be `annual_decimal_volatility`; multipliers use `dimensionless`. Missing/stale inputs fail. `disabled_ablation` must be selected explicitly to omit an adjustment. Regime/breaker definitions remain strategy inputs; no hidden rule is invented.
 
-## Additional Notes
-- Ensure all scripts and classes adhere to the module’s standard input and output requirements.
-- Reuse indicator classes where possible to avoid duplication.
-- Document any custom logic in your strategy or indicator classes for clarity.
+Every run also saves `report.xlsx` through the existing `Backtest.generate_report` exporter. Its `Run Summary` shares the canonical metrics used by `report.json`; existing `Summary Stats`, `Current Holdings` and `Trade Log` sheets remain available. Period summaries use opening equity plus completed closes in `(start, end]`, carry boundary returns, show actual UTC bounds, and flag partial periods or missing samples. Full-run drawdown appears separately from period drawdown. Flat/insufficient-sample Sharpe values are N/A. Annualisation is explicit (8,760 hours/year in the approved recipe); manual target runs without a convention leave annualised metrics undefined. Excel uses typed numeric/date cells with UTC documented; JSON retains exact Decimal values. Workbook bytes and hashes are deterministic for saved-input replay.
 
-By following this guide, you can efficiently create, test, and evaluate new trading strategies using the backtesting module.
+The output includes per-asset attribution, fees, turnover, completed-close drawdown and returns, explicit annualisation conventions, and matching cash/buy-and-hold benchmarks with the same execution/cost rules. Undefined Sharpe ratios remain undefined. `--trace` retains calculation diagnostics; otherwise they are not saved. Recipes, auxiliary inputs and generated targets are frozen and hashed alongside source code.
+
+The user-approved research baseline is [`examples/momentum.baseline.json`](examples/momentum.baseline.json), with its run settings in [`examples/momentum.baseline.run.json`](examples/momentum.baseline.run.json). It uses explicit no-IV/regime/breaker ablations and long-only capped budgets. The earlier `*.proposed.json` files are retained as design history. This baseline does not claim exact reproduction of the incomplete screenshot.
+
+The verified March–August 2026 snapshot leaves 2,560 hours for warmup and 1,856 for execution. The approved baseline was run from 15 June 2026 16:00 UTC to 1 September 2026 00:00 UTC (16 June 00:00 to 1 September 08:00 Singapore time). With the declared research costs and precision rules, 10,000 USDT ended at 9,863.78: -1.36% net return, 8.97% maximum completed-close drawdown, and 394.29 USDT fees across 2,788 fills. Equal-weight buy-and-hold returned +28.95% with substantially greater average exposure. The data, recipe, targets, journals, source bundle, benchmarks and independent verification are retained under `/Users/clawdbot/Documents/dev/research-data/btc-eth-sol-momentum-baseline-v1`; `report.html` contains the charts and CSV links.
+
+Replay from the archived source and saved run inputs produced an identical manifest. An independent integer-cash/lot verifier reconciled all 1,857 equity observations, fees, cost basis and positions. Earlier stored history has demonstrated spot/futures identity collisions and remains excluded; longer spot-history work requires separate reconstruction and qualification.
+
+The corrected execution through the existing project classes has been rerun and independently reconciled under `/Users/clawdbot/Documents/dev/research-data/btc-eth-sol-momentum-project-integration-v1`. Every fill and equity observation matches the earlier baseline, and replay from its archived corrected source produces an identical manifest. See [integration correction](../../algoDocs/backtesting/project-integration-correction.md) for the class changes and validation.
+
+## Quote runner
+
+`Backtest(..., data_source=QuoteDataSource(...))` injects actual quotes without constructing unrelated clients. The moving-average execution module accepts explicit dates, symbols and a quote dataset. Warmup rows are used only for features; prices are no longer repeatedly rescaled and missing bid/ask observations are not fabricated.
+
+Native bar/derivative access is available for research. The legacy equity execution/accounting model does not become a validated crypto derivatives simulator merely by changing storage. A bar execution profile and each product's economics remain separate increments. The retained US ETF option replay helper requires supplied point-in-time listing sources and actual stored option quotes; hosted crypto data does not imply US ETF coverage.

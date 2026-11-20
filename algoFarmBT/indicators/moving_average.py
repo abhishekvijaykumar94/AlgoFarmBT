@@ -25,17 +25,5 @@ class SimpleMovingAverage(MovingAverage):
 
         return result
 
-# Exponential Moving Average (EMA)
-class ExponentialMovingAverage(MovingAverage):
-
-    def __init__(self, period: int):
-        super().__init__(period, name="exponentialMovingAverage")
-
-    def calculate(self, data: pd.DataFrame, columns=None):
-        result = pd.DataFrame(index=data.index)  # Preserve the original index
-        columns = columns if columns else data.columns
-
-        for column in columns:
-            result[column + f"_{self.period}EMA"] = data[column].ewm(span=self.period, min_periods=self.period).mean()
-
-        return result
+# Use the shared implementation for both batch and streaming EMA calculations.
+from algoLibs.indicators.moving_average import ExponentialMovingAverage
