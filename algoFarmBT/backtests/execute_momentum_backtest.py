@@ -63,11 +63,11 @@ def resolve_run_spec(raw, data_id, code_id):
 def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
                  attachments=None, annualisation_hours=None, benchmark_weights=None, expected_data_id=None, strategy_controller=None,
                  fixed_reference_weights=None, report_context=None, signal_trace=None, retain_diagnostics=False,
-                 execution_delay_bars=0, liquidity_path=None, liquidity_policy=None):
+                 execution_delay_bars=0, liquidity_path=None, liquidity_policy=None, data_repository=None, source_bounds=None):
     destination = Path(destination)
     if destination.exists():
         raise FileExistsError(destination)
-    source = QualifiedSpotSource(snapshot)
+    source = QualifiedSpotSource(snapshot, repository=data_repository, bounds=source_bounds)
     if expected_data_id is not None and source.data_id != expected_data_id:
         raise ValueError('Snapshot changed after target preparation')
     code_id, code_files = source_snapshot()
@@ -77,7 +77,7 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
         raise ValueError('Liquidity snapshot and policy are required together')
     if liquidity_path is not None:
         from ..liquidity_inputs import load_liquidity
-        liquidity=load_liquidity(liquidity_path,source,liquidity_policy)
+        liquidity=load_liquidity(liquidity_path,QualifiedSpotSource(snapshot),liquidity_policy)
     # References are declared before evaluating any strategy returns.
     with localcontext() as decimal_context:
         decimal_context.prec=28
@@ -127,6 +127,11 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
                        evidence='manifest.json contains SHA256 of each exported artifact; manifest.sha256 pins that manifest. No report self-hash is embedded.'),
                    benchmark_declaration=dict(buy_and_hold=benchmark_weights,fixed_reference=fixed_reference_weights,
                                                policy=benchmarks['policy']))
+    if data_repository is not None:
+        context['input_integrity']['evidence'] = (
+            'Actual bars queried via DataRepository; every returned price/identity/time equals the pinned qualified snapshot; '
+            'qualified file SHA256 checked on iteration; imported source unchanged after execution')
+        context['input_integrity']['access_route'] = 'repository_query_visitor'
     if liquidity is not None:
         context['liquidity']=dict(data_id=liquidity.data_id,policy=asdict(liquidity.policy),evidence=liquidity.evidence)
     sections=backtest.report_sections(signal_trace=signal_trace)
@@ -146,9 +151,14 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
         backtest.generate_report(stage / 'report.xlsx',research=research)
         if benchmarks is not None:
             (stage / 'benchmarks.json').write_text(_json(benchmarks))
+        if data_repository is not None:
+            (stage / 'data-access.json').write_text(_json(dict(
+                route='DataRepository.query -> DataRequest.accept -> backend visitor',
+                qualification_data_id=source.data_id, reads=source.read_audit,
+                qualification='Queried bars must exactly equal the qualified price artifact; no fallback')))
         for name, content in (attachments or {}).items():
             if Path(name).name != name or name in ('result.json','spec.json','targets.json','report.json',
-                                                   'target-timing.jsonl','benchmarks.json','research.json','signals.json','execution-trace.jsonl','report.xlsx','source.zip','manifest.json','manifest.sha256'):
+                                                   'target-timing.jsonl','benchmarks.json','research.json','signals.json','execution-trace.jsonl','data-access.json','report.xlsx','source.zip','manifest.json','manifest.sha256'):
                 raise ValueError('Invalid or reserved attachment name')
             (stage / name).write_bytes(content() if callable(content) else content)
         with zipfile.ZipFile(stage / 'source.zip', 'w', compression=zipfile.ZIP_DEFLATED) as archive:
@@ -169,9 +179,29 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
     return result
 
 
+class _RecipeSchedule:
+    """Compose ordinary momentum decisions; account ownership stays in Backtest."""
+    def __init__(self, segments, observations, trace):
+        self.segments,self.observations,self.trace=segments,observations,trace
+
+    def prepare_targets(self, source, start, end):
+        from ..strategies.momentum_strategy import MomentumStrategy
+        for segment in self.segments:
+            view=QualifiedSpotSource(source.directory,repository=source.repository,
+                bounds=(segment['history_start'],segment['end']))
+            def trace(point):
+                if segment['start']<=point.time<segment['end']:self.trace(point)
+            controller=MomentumStrategy(segment['recipe'],self.observations,trace if self.trace else None)
+            try:
+                yield from controller.prepare_targets(view,segment['start'],segment['end'])
+            finally:
+                source.read_audit.extend(view.read_audit)
+
+
 def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None, retain_trace=False, *,
                  fixed_reference_weights=None, report_context=None, execution_delay_bars=0,
-                 excluded_symbols=(), excluded_horizons=(), liquidity_path=None, liquidity_policy=None):
+                 excluded_symbols=(), excluded_horizons=(), liquidity_path=None, liquidity_policy=None, data_repository=None, source_bounds=None,
+                 recipe_schedule=None):
     """Prepare a fully configured recipe, then replay its known-at targets."""
     from ..strategies.momentum_strategy import AuxiliaryObservation, MomentumStrategy, load_recipe
     if Path(destination).exists():
@@ -188,7 +218,7 @@ def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None
         frozen_recipe.write_bytes(recipe_raw)
         frozen_config.write_bytes(config_raw)
         recipe = load_recipe(frozen_recipe)
-        source = QualifiedSpotSource(snapshot)
+        source = QualifiedSpotSource(snapshot, repository=data_repository, bounds=source_bounds)
         raw_config = json.loads(config_raw)
         if raw_config['interval_seconds'] != 3600:
             raise ValueError('The supplied momentum recipe requires hourly bars')
@@ -197,6 +227,36 @@ def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None
         trace_points = [] if retain_trace else None
         trace = trace_points.append if retain_trace else None
         controller = MomentumStrategy(recipe, observations, trace, excluded_symbols=excluded_symbols, excluded_horizons=excluded_horizons)
+        if recipe_schedule is not None:
+            if not recipe_schedule or excluded_symbols or excluded_horizons:
+                raise ValueError('A nonempty recipe schedule without ablation overrides is required')
+            segments=[];previous=utc(raw_config['start'])
+            for item in recipe_schedule:
+                if set(item)!={'fold','start','end','history_start','recipe_path'}:
+                    raise ValueError('Explicit supported recipe schedule fields required')
+                raw=Path(item['recipe_path']).read_bytes()
+                path=Path(directory)/('recipe-'+str(len(segments))+'.json');path.write_bytes(raw)
+                selected=load_recipe(path)
+                start,end,history=(utc(item[k]) for k in ('start','end','history_start'))
+                if start!=previous or end<=start or history!=start-selected.warmup_bars*timedelta(hours=1):
+                    raise ValueError('Recipe schedules require contiguous windows and declared feature restarts')
+                if any(getattr(selected,k)!=getattr(recipe,k) for k in
+                       ('symbol_budgets','weight_caps','allocation_policy','rebalance','annualisation_hours')):
+                    raise ValueError('Scheduled recipes require fixed universe, allocation and annualisation')
+                # Constructing the existing view validates coverage before account execution.
+                QualifiedSpotSource(snapshot,repository=data_repository,bounds=(history,end))
+                segments.append(dict(fold=item['fold'],start=start,end=end,history_start=history,
+                    recipe=selected,recipe_sha256=hashlib.sha256(raw).hexdigest()))
+                previous=end
+            if previous!=utc(raw_config['end']):raise ValueError('Recipe schedule must cover the complete account')
+            controller=_RecipeSchedule(segments,observations,trace)
+            schedule=[dict(s,recipe=asdict(s['recipe']),execution_start=s['start']+execution_delay_bars*timedelta(hours=1)) for s in segments]
+            attachments['recipe-schedule.json']=_json(schedule).encode()
+            report_context=dict(report_context or {},recipe_switches=schedule,
+                pinned_recipe_role='Baseline fixes universe, allocation and annualisation; actual recipes are retained per switch',
+                feature_state_policy='restart_from_declared_warmup',
+                account_state_policy='carry_cash_holdings_and_cost_basis',
+                switch_timing_policy='Recipe decisions activate at each test start; uniform execution delay applies across switches; pending prior decisions retain their scheduled times; only account-end executions are censored')
         if retain_trace:
             attachments['calculation-trace.jsonl'] = lambda: ''.join(_json(asdict(point))+'\n' for point in trace_points).encode()
         definition = dict(kind='configured-momentum-recipe', name=recipe.name,
@@ -204,20 +264,26 @@ def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None
                           auxiliary_sha256=hashlib.sha256(auxiliary_raw).hexdigest() if auxiliary_raw else None,
                           iv_mode=recipe.iv_mode, regime_mode=recipe.regime_mode, breaker_mode=recipe.breaker_mode,
                           assumptions=recipe.assumptions)
+        if recipe_schedule is not None:
+            definition.update(kind='scheduled-momentum-recipes',
+                recipe_schedule_sha256=hashlib.sha256(attachments['recipe-schedule.json']).hexdigest())
         if source_snapshot()[0] != preparation_code_id:
             raise ValueError('Source code changed during target preparation')
         return run_snapshot(snapshot,frozen_config,None,destination,strategy=definition,attachments=attachments,
                             annualisation_hours=recipe.annualisation_hours,benchmark_weights=recipe.weight_caps,
-                            expected_data_id=source.data_id,strategy_controller=controller,
+                            expected_data_id=source.data_id,strategy_controller=controller,data_repository=data_repository,source_bounds=source_bounds,
                             fixed_reference_weights=fixed_reference_weights,
                             liquidity_path=liquidity_path,liquidity_policy=liquidity_policy,
                             signal_trace=trace_points,retain_diagnostics=retain_trace,execution_delay_bars=execution_delay_bars,
                             report_context=dict(report_context or {},pinned_recipe=asdict(recipe),
                                                 interventions=dict(excluded_symbols=sorted(excluded_symbols),excluded_horizons=sorted(excluded_horizons),
                                                     asset_budget_policy='retain_original_budgets_cash',horizon_weight_policy='retain_original_weights'),
-                                                disabled_adjustments={name:getattr(recipe,name) for name in ('iv_mode','regime_mode','breaker_mode')},
-                                                warmup=dict(required_bars=recipe.warmup_bars,
-                                                            policy='Recipe startup policy; not a statistical sufficiency claim')))
+                                                disabled_adjustments=({name:getattr(recipe,name) for name in ('iv_mode','regime_mode','breaker_mode')}
+                                                    if recipe_schedule is None else {'policy':'Adjustment modes are declared separately in each recipe switch'}),
+                                                warmup=(dict(required_bars=recipe.warmup_bars,
+                                                            policy='Recipe startup policy; not a statistical sufficiency claim') if recipe_schedule is None else
+                                                    dict(policy='restart_from_declared_warmup',windows=[dict(fold=s['fold'],start=s['history_start'],
+                                                        decision_start=s['start'],required_bars=s['recipe'].warmup_bars) for s in segments]))))
 
 
 def main(argv=None):
@@ -244,13 +310,25 @@ def main(argv=None):
     compare.add_argument('--auxiliary')
     compare.add_argument('--trace', action='store_true')
     for command in (run,momentum):
+        command.add_argument('--duckdb',help='Existing local DuckDB file; bars must match the qualified --snapshot')
         command.add_argument('--liquidity')
         command.add_argument('--liquidity-policy',help='JSON policy: max_participation, impact_coefficient_bps, max_age_seconds')
         command.add_argument('--report-config',help='JSON: fixed_reference_weights, optional research_record and report_context; declared before evaluation')
     validate = actions.add_parser('validate',help='Run frozen chronological validation folds')
-    for name in ('snapshot','spec','recipe','plan','output'):
-        validate.add_argument('--'+name,required=True)
+    for name in ('snapshot','spec','recipe','plan'):
+        validate.add_argument('--'+name)
+    validate.add_argument('--output',required=True)
+    validate.add_argument('--portable',action='store_true')
+    validate.add_argument('--replay',help='Verified portable study; replay through its frozen native repository')
     validate.add_argument('--auxiliary')
+    validate.add_argument('--duckdb')
+    validate.add_argument('--dry-run',action='store_true')
+    validate.add_argument('--resolved-plan')
+    validate.add_argument('--liquidity')
+    validate.add_argument('--liquidity-policy')
+    validate.add_argument('--report-config')
+    validate.add_argument('--execution-delay-bars',type=int)
+    validate.add_argument('--trace',action='store_true')
     capacity = actions.add_parser('capacity',help='Actual capital-size reruns with qualified bar liquidity')
     for name in ('snapshot','liquidity','spec','recipe','plan','output'):
         capacity.add_argument('--'+name,required=True)
@@ -265,8 +343,39 @@ def main(argv=None):
         path=qualify_liquidity(args.input,args.snapshot,args.output,availability_lag_seconds=args.availability_lag_seconds)
         print(json.dumps(dict(directory=str(path))))
     elif args.action == 'validate':
-        from .validation import run_validation
-        result=run_validation(args.snapshot,args.spec,args.recipe,args.plan,args.output,auxiliary_path=args.auxiliary)
+        from .validation import run_validation, replay_validation
+        if args.replay:
+            supplied=('snapshot','spec','recipe','plan','duckdb','auxiliary','liquidity',
+                      'liquidity_policy','report_config','resolved_plan','execution_delay_bars')
+            if any(getattr(args,name) is not None for name in supplied) or args.dry_run or args.portable or args.trace:
+                parser.error('--replay uses only its frozen study inputs and --output')
+            result=replay_validation(args.replay,args.output)
+            print(json.dumps(dict(directory=args.output,folds=len(result['folds']),status='replay_verified')))
+            return
+        if not all((args.snapshot,args.spec,args.recipe,args.plan)):
+            parser.error('validate requires --snapshot, --spec, --recipe and --plan, or --replay')
+        client=None
+        repository=None
+        options=json.loads(Path(args.report_config).read_text()) if args.report_config else {}
+        if set(options)-{'fixed_reference_weights','report_context','research_record'}:
+            raise ValueError('Unknown report-config option')
+        context=dict(options.get('report_context',{}))
+        if 'research_record' in options:context['research_record']=options['research_record']
+        if args.duckdb:
+            from algoLibs.dao import DataRepository
+            from algoLibs.market_data import DuckDBClientManager
+            client=DuckDBClientManager(path=args.duckdb)
+            repository=DataRepository(market_data_client_manager=client)
+            context['storage_input']=dict(backend='duckdb',path=str(Path(args.duckdb).resolve()),
+                sha256=digest(args.duckdb),read_only=True)
+        try:
+            result=run_validation(args.snapshot,args.spec,args.recipe,args.plan,args.output,auxiliary_path=args.auxiliary,
+                data_repository=repository,dry_run=args.dry_run,resolved_plan_path=args.resolved_plan,portable=args.portable,
+                liquidity_path=args.liquidity,liquidity_policy=json.loads(Path(args.liquidity_policy).read_text()) if args.liquidity_policy else None,
+                execution_delay_bars=args.execution_delay_bars or 0,retain_trace=args.trace,
+                fixed_reference_weights=options.get('fixed_reference_weights'),report_context=context)
+        finally:
+            if client is not None:client.close()
         print(json.dumps(dict(directory=args.output,folds=len(result['folds']))))
     elif args.action == 'compare':
         from .robustness import run_robustness
@@ -286,12 +395,24 @@ def main(argv=None):
             context['research_record']=options['research_record']
         report_options=dict(fixed_reference_weights=options.get('fixed_reference_weights'),report_context=context,
                             liquidity_path=args.liquidity,liquidity_policy=json.loads(Path(args.liquidity_policy).read_text()) if args.liquidity_policy else None)
-        if args.action == 'momentum':
-            result = run_momentum(args.snapshot,args.spec,args.recipe,args.output,args.auxiliary,args.trace,**report_options)
-            strategy = 'configured-momentum-recipe'
-        else:
-            result = run_snapshot(args.snapshot, args.spec, args.targets, args.output,**report_options)
-            strategy = 'externally-supplied-targets'
+        client = None
+        if args.duckdb:
+            from algoLibs.dao import DataRepository
+            from algoLibs.market_data import DuckDBClientManager
+            client = DuckDBClientManager(path=args.duckdb)
+            report_options['data_repository'] = DataRepository(market_data_client_manager=client)
+            context['storage_input'] = dict(backend='duckdb',path=str(Path(args.duckdb).resolve()),
+                                            sha256=digest(args.duckdb),read_only=True)
+        try:
+            if args.action == 'momentum':
+                result = run_momentum(args.snapshot,args.spec,args.recipe,args.output,args.auxiliary,args.trace,**report_options)
+                strategy = 'configured-momentum-recipe'
+            else:
+                result = run_snapshot(args.snapshot, args.spec, args.targets, args.output,**report_options)
+                strategy = 'externally-supplied-targets'
+        finally:
+            if client is not None:
+                client.close()
         print(json.dumps(dict(directory=args.output, fills=len(result.fills),
                               final_cash=str(result.final_cash), equity=str(result.equity[-1].equity),
                               total_fees=str(result.total_fees), strategy=strategy)))

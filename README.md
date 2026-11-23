@@ -103,3 +103,48 @@ See [liquidity and capacity research](docs/liquidity-capacity.md) and the explic
 [capital scenario plan](examples/momentum.capacity.json). Qualified bar volumes
 support a lagged-volume research scenario; unverified latency, spread/depth,
 fees/precision and impact calibration prevent certified capacity estimates.
+
+### Verify momentum execution through DuckDB
+
+The existing prepared run and momentum commands accept `--duckdb /path/prices.duckdb`
+alongside the required qualified `--snapshot`. `QualifiedSpotSource` then obtains
+actual hourly `public.md_bar` rows through `DataRepository.query(DataRequest)` and
+the selected backend visitor. The pinned qualified files remain the independent
+price/identity/time oracle: every returned bar must match, and missing, changed,
+duplicate or misidentified rows fail with no file fallback. Qualification is still
+required; this option does not promote raw S3 ZIP/CSV archives into validated data.
+
+```sh
+python -m algoFarmBT.backtests.execute_momentum_backtest momentum \
+  --snapshot /data/qualified-prices --duckdb /data/prices.duckdb \
+  --spec examples/momentum.baseline.run.json \
+  --recipe examples/momentum.baseline.json --trace --output /new/run
+```
+
+The same `Backtest`, strategy hooks, shared indicators, `BacktestPortfolio`,
+`Portfolio`, `Trade` and `Holding` implementations own signals, allocation,
+execution and accounting. Existing JSON/Excel output and source/data hashes are
+retained. Repository-backed runs additionally save `data-access.json`, including
+canonical query selections, rows read and whether each stream was exhausted;
+report context pins the read-only DuckDB file hash. `--trace` saves the existing
+calculation and execution diagnostics. Intermediate Decimal values can retain
+different trailing-zero scales across storage engines; economic equality is
+exact numeric equality rather than diagnostic text formatting.
+
+Generated holdout, rolling and expanding frozen-recipe schedules use the same
+`validate` action. Preview with `--dry-run`, then pass its `--resolved-plan` to
+execute. See [chronological validation](docs/chronological-validation.md) and
+`examples/momentum.walk-forward.json`. Training selection uses the same command with `selection_rule: training_rank`;
+see `examples/momentum.training-validation.json` for the bounded candidate plan.
+
+Portable v2 studies add `--portable` to preview and execution. Replay with
+`validate --replay saved-study --output replayed-study`; it verifies the bundle
+and uses the existing frozen snapshot visitor without the original database.
+
+
+Continuous-account walk-forward execution uses the same `validate` command with
+`capital_policy: continuous_account`; see
+`examples/momentum.continuous-validation.json` and the
+[capital, feature-state and switch policies](docs/chronological-validation.md#continuous-portfolio-account-issue-19).
+Selected test targets run through one existing Backtest/Portfolio ledger, with
+continuous results reported separately from independent-reset fold diagnostics.

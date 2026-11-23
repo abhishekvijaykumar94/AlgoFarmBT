@@ -1,0 +1,35 @@
+{
+  "schema": "chronological-validation-v2",
+  "name": "btc-eth-sol-frozen-rolling-development",
+  "hypothesis": "Exercise frozen chronological evaluation on previously inspected history; no new out-of-sample evidence is claimed.",
+  "capital_policy": "independent_reset_accounts",
+  "selection_rule": "frozen_recipe",
+  "recipe_sha256": "55cb8d933a3c694eb970ed01ee73f3d73bd3e1e2d36c6c1c74c56a418aee4f80",
+  "inspected_through": "2026-09-01T00:00:00Z",
+  "prior_trials": {
+    "status": "unknown"
+  },
+  "statistics": {
+    "seed": 604,
+    "block_days": 7,
+    "replications": 500,
+    "confidence": 0.95,
+    "iid_assumption": false,
+    "benchmark_annual_sharpe": "0"
+  },
+  "mode": "rolling",
+  "designation": "development",
+  "bounds": {
+    "start": "2026-06-15T16:00:00Z",
+    "end": "2026-08-31T17:00:00Z"
+  },
+  "window": {
+    "train_bars": 768,
+    "test_bars": 360,
+    "step_bars": 360,
+    "gap_bars": 1,
+    "partial_final_fold": "drop"
+  },
+  "feature_history_policy": "restart_from_declared_warmup",
+  "max_evaluations": 3
+}

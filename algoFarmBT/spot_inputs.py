@@ -13,7 +13,7 @@ from dataclasses import asdict
 import hashlib
 import heapq
 import io
-from itertools import groupby
+from itertools import chain, groupby, zip_longest
 import json
 from pathlib import Path
 import re
@@ -22,7 +22,7 @@ import tempfile
 import zipfile
 
 from algoLibs.backtest.types import SpotBar, number
-from algoLibs.market_data.types import decode, encode, utc
+from algoLibs.market_data.types import DataRequest, decode, encode, utc
 
 HOUR = timedelta(hours=1)
 FIELDS = ('open', 'high', 'low', 'close', 'volume', 'trade_count', 'taker_buy_base_volume')
@@ -193,11 +193,13 @@ def qualify_price_bars(directory, destination):
 
 class QualifiedSpotSource:
     """Repeatable, hashed, chronological bar batches using O(symbols) merge state."""
-    def __init__(self, directory, batch_size=1000):
+    def __init__(self, directory, batch_size=1000, *, repository=None, bounds=None):
         self.directory = Path(directory)
         if type(batch_size) is not int or not 1 <= batch_size <= 100000:
             raise ValueError('Invalid batch size')
         self.batch_size = batch_size
+        self.repository = repository
+        self.read_audit = []
         raw = (self.directory / 'manifest.json').read_bytes()
         expected = (self.directory / 'manifest.sha256').read_text().strip()
         if hashlib.sha256(raw).hexdigest() != expected:
@@ -206,13 +208,89 @@ class QualifiedSpotSource:
         self._manifest = decode(json.loads(raw))
         if self._manifest['format'] != 'qualified-spot-price-bars-v1':
             raise ValueError('Unsupported price-bar artifact')
+        self.bounds = tuple(utc(t) for t in bounds) if bounds is not None else None
+        if self.bounds is not None:
+            start, end = self.bounds
+            if (not utc(self._manifest['start']) <= start < end <= utc(self._manifest['end'])
+                    or any(t.minute or t.second or t.microsecond for t in self.bounds)):
+                raise ValueError('Bounded prices require covered, hourly aligned bounds')
 
     @property
     def manifest(self):
-        return copy.deepcopy(self._manifest)
+        manifest = copy.deepcopy(self._manifest)
+        if self.bounds is not None:
+            manifest['qualified_bounds'] = dict(start=utc(manifest['start']), end=utc(manifest['end']))
+            manifest['start'], manifest['end'] = self.bounds
+            manifest['view'] = dict(qualification_data_id=self.data_id,
+                policy='Bounded view; entry hashes and row counts describe the complete qualification files')
+        return manifest
 
     def __iter__(self):
+        if self.repository is None:
+            yield from self._file_batches()
+            return
+        # The repository supplies the actual simulation bars. The existing
+        # immutable price artifact is the independent qualification oracle;
+        # mismatches fail, with no file-reader fallback.
+        file_batches = self._file_batches()
+        queried = self._repository_bars()
+        batch = []
+        try:
+            for actual, expected in zip_longest(queried, chain.from_iterable(file_batches)):
+                if actual != expected:
+                    raise ValueError('Repository price bars differ from the qualified snapshot')
+                batch.append(actual)
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+        finally:
+            queried.close()
+            file_batches.close()
+
+    def _repository_bars(self):
         manifest = self.manifest
+        symbols = {e['symbol'] for e in manifest['entries']}
+        identities = {s: {(r['instrument_id'], r['venue_id']) for r in manifest['sources']
+                          if r['symbol'] == s} for s in symbols}
+        if any(len(pairs) != 1 for pairs in identities.values()):
+            raise ValueError('Repository price bars require one qualified canonical identity per symbol')
+        pairs = {s: next(iter(values)) for s, values in identities.items()}
+        if len(set(pairs.values())) != len(pairs):
+            raise ValueError('Qualified symbols must have distinct canonical identities')
+
+        def read(symbol):
+            instrument, venue = pairs[symbol]
+            request = DataRequest('public.md_bar', manifest['start'], manifest['end'],
+                filters={'instrument_id': instrument, 'venue_id': venue, 'interval': '1h', 'bar_type': 'trade'},
+                columns=('ts', 'instrument_id', 'venue_id', 'interval', 'bar_type', 'open', 'close'),
+                batch_size=self.batch_size)
+            audit = dict(symbol=symbol, request=asdict(request), rows=0, complete=False)
+            self.read_audit.append(audit)
+            batches = iter(self.repository.query(request))
+            try:
+                for rows in batches:
+                    for row in rows:
+                        if (row['instrument_id'], row['venue_id'], row['interval'], row['bar_type']) != (instrument, venue, '1h', 'trade'):
+                            raise ValueError('Repository row differs from its qualified market selection')
+                        audit['rows'] += 1
+                        yield SpotBar(symbol, row['ts'], row['ts'] + HOUR, row['open'], row['close'])
+                audit['complete'] = True
+            finally:
+                close = getattr(batches, 'close', None)
+                if close is not None:
+                    close()
+
+        streams = [read(s) for s in sorted(symbols)]
+        try:
+            yield from heapq.merge(*streams, key=lambda b: (b.start, b.symbol))
+        finally:
+            for stream in streams:
+                stream.close()
+
+    def _file_batches(self):
+        manifest = self._manifest
         entries = manifest['entries']
         if not entries or len({e['symbol'] for e in entries}) != len(entries):
             raise ValueError('Unique nonempty artifact entries required')
@@ -220,7 +298,7 @@ class QualifiedSpotSource:
             if digest(local_file(self.directory, entry['file'])) != entry['sha256']:
                 raise ValueError('Price-bar data hash mismatch')
         def read(entry):
-            previous, count = None, 0
+            previous, count, selected = None, 0, 0
             with local_file(self.directory, entry['file']).open() as stream:
                 for line in stream:
                     bar = SpotBar(**decode(json.loads(line)))
@@ -232,7 +310,13 @@ class QualifiedSpotSource:
                         raise ValueError('Artifact gap or ordering error')
                     previous = bar.start
                     count += 1
-                    yield bar
+                    if self.bounds is None or self.bounds[0] <= bar.start < self.bounds[1]:
+                        if self.bounds is not None and (bar.start != self.bounds[0]+selected*HOUR or bar.end > self.bounds[1]):
+                            raise ValueError('Incomplete or unaligned bounded price coverage')
+                        selected += 1
+                        yield bar
+            if self.bounds is not None and selected != int((self.bounds[1]-self.bounds[0])/HOUR):
+                raise ValueError('Incomplete bounded price coverage')
             if count != entry['rows']:
                 raise ValueError('Artifact row count mismatch')
         batch = []

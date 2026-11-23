@@ -7,7 +7,6 @@ Examples:
   python -m algoFarmBT.data read --request request.json --snapshot snapshot
 """
 import argparse
-from dataclasses import asdict
 import json
 from pathlib import Path
 from algoLibs.market_data import DataRequest, MarketDataReader, SnapshotReader
@@ -19,9 +18,30 @@ def main(argv=None):
     parser.add_argument('action', choices=['catalog', 'read', 'prepare'])
     parser.add_argument('--request', help='JSON request object or list of request objects')
     parser.add_argument('--output', help='New immutable snapshot directory')
-    parser.add_argument('--snapshot', help='Read a prepared snapshot offline')
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument('--snapshot', help='Read a prepared snapshot offline')
+    sources.add_argument('--duckdb', help='Read an existing local DuckDB database file')
+    sources.add_argument('--parquet', help='JSON mapping of registered datasets to local Parquet file lists')
     args = parser.parse_args(argv)
-    reader = SnapshotReader(args.snapshot) if args.snapshot else MarketDataReader()
+    client = None
+    if args.snapshot:
+        reader = SnapshotReader(args.snapshot)
+    elif args.duckdb or args.parquet:
+        from algoLibs.dao.data_repository import DataRepository
+        from algoLibs.market_data.duckdb import DuckDBClientManager
+        mapping = json.loads(Path(args.parquet).read_text()) if args.parquet else None
+        client = DuckDBClientManager(path=args.duckdb or ':memory:', parquet_sources=mapping)
+        reader = MarketDataReader(repository=DataRepository(market_data_client_manager=client))
+    else:
+        reader = MarketDataReader()
+    try:
+        return _execute(parser, args, reader)
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _execute(parser, args, reader):
     if args.action == 'catalog':
         if args.snapshot:
             print(json.dumps(encode(reader.manifest), indent=2))
