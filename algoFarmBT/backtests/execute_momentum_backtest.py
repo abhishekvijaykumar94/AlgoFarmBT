@@ -242,7 +242,7 @@ def run_momentum(snapshot, config, recipe_path, destination, auxiliary_path=None
                 path=Path(directory)/('recipe-'+str(len(segments))+'.json');path.write_bytes(raw)
                 selected=load_recipe(path)
                 start,end,history=(utc(item[k]) for k in ('start','end','history_start'))
-                if start!=previous or end<=start or history!=start-selected.warmup_bars*timedelta(hours=1):
+                if start!=previous or end<=start or history!=source.history_start(start,selected.warmup_bars):
                     raise ValueError('Recipe schedules require contiguous windows and declared feature restarts')
                 if any(getattr(selected,k)!=getattr(recipe,k) for k in
                        ('symbol_budgets','weight_caps','allocation_policy','rebalance','annualisation_hours')):

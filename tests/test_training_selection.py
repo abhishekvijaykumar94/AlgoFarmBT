@@ -314,3 +314,27 @@ class TrainingSelectionTests(unittest.TestCase):
         self.assertEqual([t['score'] for t in normal['trials']],[t['score'] for t in small['trials']])
         self.assertEqual(normal['selected_candidate'],'vol510')
         self.assertEqual(small['selected_candidate'],'vol510')
+
+    def test_gap_policy_resolves_observed_history_for_training_candidates_and_test(self):
+        from algoLibs.market_data.types import encode
+        self.inputs()
+        path=self.prices/'manifest.json';manifest=decode(json.loads(path.read_text()))
+        manifest.update(format='qualified-spot-price-bars-v3',availability_policy='observed_hourly_preserve_state_v1',availability_exclusions=[])
+        for entry in manifest['entries']:
+            file=self.prices/entry['file'];rows=[decode(json.loads(line)) for line in file.read_text().splitlines()]
+            if entry['symbol']=='BTCUSDT':rows=[r for r in rows if r['start']!=T+100*H]
+            file.write_text(''.join(json.dumps(encode(r))+'\n' for r in rows))
+            entry.update(rows=len(rows),sha256=hashlib.sha256(file.read_bytes()).hexdigest(),first_observed=T,end=T+744*H,gaps=[dict(start=T+100*H,end=T+101*H)] if entry['symbol']=='BTCUSDT' else [])
+        path.write_text(json.dumps(encode(manifest)));(self.prices/'manifest.sha256').write_text(hashlib.sha256(path.read_bytes()).hexdigest())
+        with self.database.transaction(readonly=False) as connection:
+            connection.execute('DELETE FROM public.md_bar WHERE instrument_id=1 AND ts=?',[T+100*H])
+        self.database.close()
+        output,report,preview=self.study('preserved','--duckdb',self.path,'--portable')
+        self.assertEqual(report['folds'][0]['status'],'succeeded')
+        self.assertEqual(preview['windows'][0]['training_history_start'],T+15*H)
+        self.assertEqual(preview['windows'][0]['history_start'],T+88*H)
+        self.assertTrue(all(c['training_history_start']==T+15*H and c['test_history_start']==T+88*H for c in preview['candidate_windows']))
+        for trial in report['selections']['fold-001']['trials']:
+            run=output/'cases/fold-001/training'/trial['artifacts']/'run'
+            audit=decode(json.loads((run/'data-access.json').read_text()))
+            self.assertTrue(all(r['request']['start']==T+15*H and r['request']['end']==T+600*H for r in audit['reads']))

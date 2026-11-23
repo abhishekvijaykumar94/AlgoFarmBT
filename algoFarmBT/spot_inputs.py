@@ -11,6 +11,7 @@ import copy
 import csv
 from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
+from decimal import localcontext
 import hashlib
 import heapq
 import io
@@ -96,6 +97,8 @@ def _observed_archive_rows(root, comparison):
                     if stamp.minute or stamp.second or stamp.microsecond or closing!=stamp+HOUR-timedelta(microseconds=1000000//factor):
                         rows.excluded.append(dict(time=stamp,reason='invalid_hourly_boundary_or_close',source_url=item['source_url']))
                         continue
+                    if 'repair_targets' in comparison and (number(values[5])==0 or number(values[8])==0):
+                        rows.excluded.append(dict(time=stamp,reason='zero_trade_hour_not_executable',source_url=item['source_url']));continue
                     if stamp in rows:raise ValueError('Overlapping duplicate source timestamp')
                     rows[stamp]=dict(zip(('open','high','low','close','volume','quote_volume','trade_count','taker_buy_base_volume','taker_buy_quote_volume'),
                         [number(values[i]) for i in (1,2,3,4,5,7,8,9,10)]))
@@ -104,7 +107,47 @@ def _observed_archive_rows(root, comparison):
         if a>covered:break
         covered=max(covered,b)
     if covered<end:raise ValueError('Source archive calendars do not cover the selection')
+    if 'repair_targets' in comparison:_repair_reference(root,comparison,rows)
     return rows
+
+
+def _repair_reference(root,comparison,rows):
+    """Independent raw-CSV oracle for the application's minute reconstruction."""
+    symbol=comparison['symbol'];targets={utc(t):[] for t in comparison['repair_targets']}
+    if len(targets)!=len(comparison['repair_targets']):raise ValueError('Duplicate oracle repair target')
+    for item in comparison.get('repair_sources',[]):
+        filename=item['file']
+        match=re.fullmatch(symbol+r'-1m-(\d{4}-\d{2}-\d{2})\.zip',filename)
+        if not match or item['source_url']!='https://data.binance.vision/data/spot/daily/klines/'+symbol+'/1m/'+filename:raise ValueError('Official daily minute source required')
+        origin=datetime.strptime(match[1],'%Y-%m-%d').replace(tzinfo=timezone.utc)
+        path=local_file(root,filename);check=local_file(root,filename+'.CHECKSUM').read_text().split()
+        if len(check)!=2 or check[0]!=item['sha256'] or digest(path)!=item['sha256'] or check[1].lstrip('*')!=filename:raise ValueError('Minute checksum mismatch')
+        if path.stat().st_size>16*1024*1024:raise ValueError('Minute archive exceeds size limit')
+        with zipfile.ZipFile(path) as z:
+            if z.namelist()!=[filename[:-4]+'.csv'] or z.infolist()[0].file_size>32*1024*1024:raise ValueError('Bounded matching minute CSV required')
+            factor=1000000 if origin.year>=2025 else 1000;quantum=timedelta(microseconds=1000000//factor);previous=None
+            def stamp(v):
+                seconds,fraction=divmod(int(v),factor)
+                return datetime.fromtimestamp(seconds,timezone.utc).replace(microsecond=fraction*(1000000//factor))
+            with z.open(z.namelist()[0]) as raw:
+                for v in csv.reader(io.TextIOWrapper(raw,encoding='utf-8-sig')):
+                    if v[0]=='open_time':continue
+                    if len(v)!=12:raise ValueError('Minute row width differs')
+                    t=stamp(v[0]);end=stamp(v[6])
+                    if not origin<=t<origin+timedelta(days=1) or (previous is not None and t<=previous):raise ValueError('Minute ordering/partition mismatch')
+                    previous=t;hour=t.replace(minute=0,second=0,microsecond=0)
+                    if hour in targets:targets[hour].append((t,end,quantum,[number(v[i]) for i in (1,2,3,4,5,7,8,9,10)]))
+    for hour,minutes in targets.items():
+        if hour in rows:raise ValueError('Oracle repair overlaps valid original hour')
+        minutes.sort(key=lambda x:x[0])
+        if len(minutes)!=60 or any(t!=hour+timedelta(minutes=i) or end!=t+timedelta(minutes=1)-q for i,(t,end,q,v) in enumerate(minutes)):continue
+        with localcontext() as context:
+            context.prec=80
+            values=[m[3] for m in minutes]
+            if any(min(v[:4])<=0 or v[1]<max(v[0],v[3]) or v[2]>min(v[0],v[3]) or any(x<0 for x in v[4:]) or v[6]!=int(v[6]) for v in values):raise ValueError('Invalid minute price/volume/trades')
+            sums=[sum(v[i] for v in values) for i in range(4,9)]
+            if sums[0]==0 or sums[2]==0:continue
+            rows[hour]=dict(zip(('open','high','low','close','volume','quote_volume','trade_count','taker_buy_base_volume','taker_buy_quote_volume'),[values[0][0],max(v[1] for v in values),min(v[2] for v in values),values[-1][3]]+sums))
 
 
 def archive_rows(root, comparison):
@@ -172,7 +215,7 @@ def qualify_price_bars(directory, destination):
     native = local_file(root, report['native_file'])
     if digest(native) != report['native_sha256']:
         raise ValueError('Native extraction checksum mismatch')
-    observed=report.get('availability_policy')=='observed_hourly_cash_for_unready'
+    observed=report.get('availability_policy') in ('observed_hourly_cash_for_unready','observed_hourly_preserve_state_v1')
     if 'availability_policy' in report and not observed:raise ValueError('Unsupported availability policy')
     comparisons = {}
     for item in report['comparisons']:
@@ -188,6 +231,8 @@ def qualify_price_bars(directory, destination):
                     exported_fields=['symbol', 'start', 'end', 'open', 'close'],
                     excluded_fields=list(DIAGNOSTIC_FIELDS), entries=[], sources=[], diagnostics={})
     if observed:manifest.update(format='qualified-spot-price-bars-v2',availability_policy=report['availability_policy'],availability_exclusions=[])
+    if report.get('availability_policy')=='observed_hourly_preserve_state_v1':
+        manifest.update(format='qualified-spot-price-bars-v3',gap_policy=dict(ema='alpha_eff=1-(1-alpha)**elapsed_hours',volatility='log_return_squared/elapsed_hours; time-decayed zero-mean EWMA',warmup='actual_observed_bars',incomplete_active_frame='no_new_target',execution='missing_open_cancel_without_deferral',long_gap_review_hours=24))
     seen, streams, counts, previous_times = set(), {}, {}, {}
     first_times={};gaps={}
     try:
@@ -249,6 +294,8 @@ def qualify_price_bars(directory, destination):
             filename = symbol + '.jsonl'
             manifest['entries'].append(dict(symbol=symbol, file=filename, rows=counts[symbol], sha256=digest(stage / filename)))
             if observed:manifest['entries'][-1].update(first_observed=first_times[symbol],end=previous_times[symbol]+HOUR,gaps=gaps[symbol])
+        if manifest.get('format')=='qualified-spot-price-bars-v3':
+            manifest['long_gap_review']=[dict(symbol=e['symbol'],**g) for e in manifest['entries'] for g in e['gaps'] if (utc(g['end'])-utc(g['start']))>=24*HOUR]
         raw = _json(manifest).encode()
         (stage / 'manifest.json').write_bytes(raw)
         (stage / 'manifest.sha256').write_text(hashlib.sha256(raw).hexdigest() + '\n')
@@ -276,10 +323,10 @@ class QualifiedSpotSource:
             raise ValueError('Price-bar manifest hash mismatch')
         self.data_id = 'sha256:' + expected
         self._manifest = decode(json.loads(raw))
-        if self._manifest['format'] not in ('qualified-spot-price-bars-v1','qualified-spot-price-bars-v2'):
+        if self._manifest['format'] not in ('qualified-spot-price-bars-v1','qualified-spot-price-bars-v2','qualified-spot-price-bars-v3'):
             raise ValueError('Unsupported price-bar artifact')
         self.availability_policy=self._manifest.get('availability_policy','strict')
-        if self.availability_policy not in ('strict','observed_hourly_cash_for_unready'):
+        if self.availability_policy not in ('strict','observed_hourly_cash_for_unready','observed_hourly_preserve_state_v1'):
             raise ValueError('Unsupported source availability policy')
         self.asset_first_observed={e['symbol']:utc(e['first_observed']) for e in self._manifest['entries']} if self.availability_policy!='strict' else {}
         self.bounds = tuple(utc(t) for t in bounds) if bounds is not None else None
@@ -288,6 +335,30 @@ class QualifiedSpotSource:
             if (not utc(self._manifest['start']) <= start < end <= utc(self._manifest['end'])
                     or any(t.minute or t.second or t.microsecond for t in self.bounds)):
                 raise ValueError('Bounded prices require covered, hourly aligned bounds')
+
+    def history_start(self,start,warmup_bars):
+        """Resolve prior observed bars using only past availability metadata."""
+        start=utc(start)
+        if type(warmup_bars) is not int or warmup_bars<1:raise ValueError('Positive observed warmup required')
+        if self.availability_policy!='observed_hourly_preserve_state_v1':return start-warmup_bars*HOUR
+        starts=[]
+        for entry in self._manifest['entries']:
+            first=utc(entry['first_observed']);stop=min(start,utc(entry['end']))
+            if first>=stop:continue
+            cursor=first;segments=[]
+            for gap in entry['gaps']:
+                a,b=utc(gap['start']),utc(gap['end'])
+                if a>=stop:break
+                if cursor<a:segments.append((cursor,min(a,stop)))
+                cursor=max(cursor,b)
+            if cursor<stop:segments.append((cursor,stop))
+            needed=warmup_bars;chosen=first
+            for a,b in reversed(segments):
+                count=int((b-a)/HOUR)
+                if count>=needed:chosen=b-needed*HOUR;break
+                needed-=count
+            starts.append(chosen)
+        return min(starts) if starts else utc(self._manifest['start'])
 
     @property
     def manifest(self):

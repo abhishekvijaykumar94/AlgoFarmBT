@@ -8,7 +8,7 @@ from algoLibs.market_data.types import encode
 T=datetime(2026,5,1,tzinfo=timezone.utc);H=timedelta(hours=1)
 
 
-def observed_fixture(root):
+def observed_fixture(root,policy='observed_hourly_cash_for_unready'):
     native=[];comparisons=[]
     for ident,symbol in enumerate(('BTCUSDT','SOLUSDT'),1):
         stream=io.StringIO();writer=csv.writer(stream)
@@ -32,7 +32,7 @@ def observed_fixture(root):
     raw=''.join(json.dumps(encode(r))+'\n' for r in native).encode();(root/'native.jsonl').write_bytes(raw)
     (root/'qualification.json').write_text(json.dumps(dict(kind='spot-archive-comparison',interval='1h',
         start=T.isoformat(),end=(T+24*H).isoformat(),native_file='native.jsonl',native_sha256=hashlib.sha256(raw).hexdigest(),
-        availability_policy='observed_hourly_cash_for_unready',comparisons=comparisons)))
+        availability_policy=policy,comparisons=comparisons)))
     return qualify_price_bars(root,root/'prices')
 
 

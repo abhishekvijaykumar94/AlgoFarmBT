@@ -532,3 +532,17 @@ but none has an eligible finite score. Each trial's reason and `fallback_used` a
 retained. Runtime/integrity failures still fail the fold, and omitting this option
 preserves the existing fail-on-no-eligible-score behavior. This is a historical
 research convention, not evidence that the fallback was selected by performance.
+
+### Historic gaps and observed warmup
+
+`observed_hourly_preserve_state_v1` is an explicit qualified-source policy (price artifact v3). Strict sources and the earlier `observed_hourly_cash_for_unready` policy retain their original behavior for reproducibility. The acquisition qualification job can rebuild a declared missing or rejected hour from 60 checksum-verified, consecutive, correctly bounded minute candles. It never rounds shifted hourly candles, interpolates prices, or manufactures executions. Source archives, reconstruction receipts and unresolved hours remain recorded.
+
+The same policy applies to training, test and continuous accounts:
+
+* Initial/new-asset warmup counts actual observations. `QualifiedSpotSource.history_start(start, warmup_bars)` selects preceding observed bars from past availability metadata. Generated validation windows, candidate trials and recipe schedules use this method, so a gap does not silently shorten each fold's warmup.
+* A gap preserves recursive indicator state. For elapsed hours `n`, each EMA uses `alpha_eff = 1 - (1-alpha)**n`; the observed log return is `r = log(close/previous_close)`. The zero-mean hourly variance update uses `r*r/n` and the corresponding elapsed-time decay. This is an explicit estimate from the endpoint return, not a reconstruction of the unobserved price path. This policy supports log returns and zero-mean EWMA variance only.
+* An incomplete frame for already active assets produces no new basket target. After observations resume, indicators continue without a fresh 2,560-hour reset. Initial warmup and declared fold feature restarts still apply.
+* The existing Backtest account carries cash, holdings and cost basis. A missing required opening frame cancels the scheduled intent without deferral. Zero-trade hourly observations are excluded from executable inputs. Source gaps do not generate synthetic zero returns or fills.
+* Residual intervals of at least 24 hours are listed for research review in the source manifest. This threshold is a review convention, not an automatic liquidation/reset rule. A larger outage may justify changing the research universe or rebuilding state from validated history; that decision must be explicit and versioned.
+
+Sparse-source reports retain the financial ledger and availability audit. Regular-grid optional analytics and benchmarks without a declared gap/listing entry policy remain unavailable. Run results must be interpreted with these limitations. The original sealed study is retained; repaired inputs and policy changes produce a new data identity and new result directory.

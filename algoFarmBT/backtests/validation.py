@@ -356,6 +356,10 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
     if continuous and any(utc(a['test_end'])!=utc(b['test_start']) for a,b in zip(folds,folds[1:])):
         raise ValueError('Continuous account requires contiguous test coverage')
     source=QualifiedSpotSource(snapshot);code_id,code_files=source_snapshot()
+    if source.availability_policy=='observed_hourly_preserve_state_v1':
+        for window in windows:
+            window['training_history_start']=source.history_start(window['train_start'],window['warmup_bars'])
+            window['history_start']=source.history_start(window['test_start'],window['warmup_bars'])
     base_spec,_=resolve_run_spec(base,source.data_id,code_id)
     if generated and {e['symbol'] for e in source.manifest['entries']}!={r['symbol'] for r in base['rules']}:
         raise ValueError('Price symbols must match the run instruments')
@@ -401,8 +405,8 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
         definition['candidates']=candidates
         definition['candidate_windows']=[dict(fold=w['id'],candidate=c['id'],
             train_start=w['train_start'],train_end=w['train_end'],test_start=w['test_start'],test_end=w['test_end'],
-            training_history_start=w['train_start']-c['warmup_bars']*timedelta(hours=1),
-            test_history_start=w['test_start']-c['warmup_bars']*timedelta(hours=1)) for w in windows for c in candidates]
+            training_history_start=source.history_start(w['train_start'],c['warmup_bars']),
+            test_history_start=source.history_start(w['test_start'],c['warmup_bars'])) for w in windows for c in candidates]
     native_requests=_native_requests(coverage) if portable else []
     if portable:native_requests+=_reference_requests(data_repository,native_requests)
     if portable:definition['native_requests']=[asdict(r) for r in native_requests]
@@ -487,7 +491,7 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
                 def train(candidate, trial_folder):
                     return child(trial_folder,window['train_start'].isoformat(),window['train_end'].isoformat(),
                         common/'candidates'/(candidate['id']+'.json'),
-                        (window['train_start']-candidate['warmup_bars']*timedelta(hours=1),window['train_end']),
+                        (source.history_start(window['train_start'],candidate['warmup_bars']),window['train_end']),
                         dict(context,validation_phase='training',research_record=dict(hypothesis=plan['hypothesis'],
                             designation='development',parameter_changes=[],related_runs=ids)))
                 trials=run_related_cases(candidates,training,train,_write)
@@ -524,8 +528,8 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
                     candidate=next(c for c in candidates if c['id']==winner['case_id'])
                     recipe_path=folder/'selected-recipe.json'
                     shutil.copyfile(common/'candidates'/(candidate['id']+'.json'),recipe_path)
-                    bounds=(window['test_start']-candidate['warmup_bars']*timedelta(hours=1),window['test_end'])
-                    selection.update(training_history_start=window['train_start']-candidate['warmup_bars']*timedelta(hours=1),
+                    bounds=(source.history_start(window['test_start'],candidate['warmup_bars']),window['test_end'])
+                    selection.update(training_history_start=source.history_start(window['train_start'],candidate['warmup_bars']),
                         test_history_start=bounds[0])
                 _write(folder/'selection.json',selection)
                 if not winner:raise ValueError('Training selection failed; no test run permitted')

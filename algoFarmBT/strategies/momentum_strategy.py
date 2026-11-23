@@ -257,15 +257,15 @@ class _State:
         self.squares = [ExponentialMovingAverage(recipe.rv_fast_span, adjust=False, min_periods=1), ExponentialMovingAverage(recipe.rv_slow_span, adjust=False, min_periods=1)]
         self.previous, self.count = None, 0
 
-    def update(self, bar, book):
+    def update(self, bar, book, elapsed_hours=1):
         r = self.recipe
         self.count += 1
-        values = {s: ema.update(bar.close) for s, ema in self.emas.items()}
+        values = {s: ema.update(bar.close,elapsed_periods=elapsed_hours) for s, ema in self.emas.items()}
         if self.previous is not None:
             ratio = bar.close / self.previous
             ret = ratio.ln() if r.return_kind == 'log' else ratio - 1
             for mean, square in zip(self.means, self.squares):
-                mean.update(ret); square.update(ret * ret)
+                mean.update(ret/elapsed_hours,elapsed_periods=elapsed_hours); square.update(ret * ret/elapsed_hours,elapsed_periods=elapsed_hours)
         self.previous = bar.close
         variances = [max(Decimal(0), (square.value or Decimal(0)) -
                          (mean.value ** 2 if r.rv_estimator == 'ewma_central_variance' and mean.value is not None else 0))
@@ -294,10 +294,10 @@ class _State:
         forecasts, horizon_points = [], []
         for i, (fast, slow, _) in enumerate(r.horizons):
             macd = values[fast] - values[slow]
-            histogram = macd - self.signals[i].update(macd) if self.signals[i] else macd
+            histogram = macd - self.signals[i].update(macd,elapsed_periods=elapsed_hours) if self.signals[i] else macd
             normalised = histogram / denominator * iv_multiplier
             clipped = min(r.forecast_clip, max(-r.forecast_clip, normalised))
-            forecasts.append(self.smoothed[i].update(clipped))
+            forecasts.append(self.smoothed[i].update(clipped,elapsed_periods=elapsed_hours))
             if self.capture:
                 weight = Decimal(0) if (fast, slow) in self.excluded_horizons else r.horizons[i][2]
                 horizon_points.append(HorizonPoint(fast, slow, weight, histogram, normalised,
@@ -336,10 +336,10 @@ class MomentumStrategy(CoreTradingStrategy):
         if not self.excluded_symbols < symbols or not self.excluded_horizons < horizons:
             raise ValueError('Exclusions must be known and leave at least one asset and horizon')
 
-    def apply_indicators(self, frame):
+    def apply_indicators(self, frame, elapsed_hours=None):
         """Prepare causal feature records for one complete bar frame."""
         self._book.advance(frame[0].end)
-        return [self._states[b.symbol].update(b,self._book) for b in sorted(frame,key=lambda b:b.symbol)]
+        return [self._states[b.symbol].update(b,self._book,(elapsed_hours or {}).get(b.symbol,1)) for b in sorted(frame,key=lambda b:b.symbol)]
 
     def generate_signal(self, points):
         """The bulk research interface emits desired weights, not order messages."""
@@ -351,7 +351,12 @@ class MomentumStrategy(CoreTradingStrategy):
         """Emit targets at completed-bar ends, retaining recursive state across chunks."""
         recipe, auxiliary, trace = self.recipe, self.auxiliary, self.trace
         start, end = utc(start), utc(end)
-        observed=getattr(source,'availability_policy','strict')=='observed_hourly_cash_for_unready'
+        policy=getattr(source,'availability_policy','strict')
+        if policy not in ('strict','observed_hourly_cash_for_unready','observed_hourly_preserve_state_v1'):raise ValueError('Unsupported momentum availability policy')
+        observed=policy in ('observed_hourly_cash_for_unready','observed_hourly_preserve_state_v1')
+        preserve=policy=='observed_hourly_preserve_state_v1'
+        if preserve and (recipe.rv_estimator!='ewma_zero_mean_variance' or recipe.return_kind!='log'):
+            raise ValueError('Elapsed-time gap policy requires log returns and zero-mean EWMA variance')
         if start >= end or (end - start) % HOUR:
             raise ValueError('Momentum run needs complete hourly intervals')
         with localcontext() as context:
@@ -377,19 +382,23 @@ class MomentumStrategy(CoreTradingStrategy):
             target = None
             with localcontext() as context:
                 context.prec = 50
+                elapsed_hours={}
                 if observed:
                     for bar in frame:
-                        if bar.symbol in last_seen and timestamp!=last_seen[bar.symbol]+HOUR:
+                        elapsed_hours[bar.symbol]=int((timestamp-last_seen[bar.symbol])/HOUR) if preserve and bar.symbol in last_seen else 1
+                        if not preserve and bar.symbol in last_seen and timestamp!=last_seen[bar.symbol]+HOUR:
                             states[bar.symbol]=_State(recipe,trace is not None,bar.symbol in self.excluded_symbols,self.excluded_horizons)
                         last_seen[bar.symbol]=timestamp
-                points = self.apply_indicators(frame)
+                points = self.apply_indicators(frame,elapsed_hours)
                 if decision >= start:
                     if not observed and not began and decision != start:
                         raise ValueError('No completed bar is available at requested run start')
                     if not observed and not all(p.warmup_complete for p in points):
                         raise ValueError('Insufficient pre-run warmup for the configured recipe')
                     began = True
-                    target = self.generate_signal(points)[0]
+                    active=set(last_seen) | {s for s,t in getattr(source,'asset_first_observed',{}).items() if t<=timestamp}
+                    if not preserve or active<={b.symbol for b in frame}:
+                        target = self.generate_signal(points)[0]
             if trace is not None:
                 for point in points:
                     trace(point)
