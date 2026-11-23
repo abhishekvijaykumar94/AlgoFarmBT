@@ -86,18 +86,19 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
     fixed_reference_weights=dict(fixed_reference_weights) if fixed_reference_weights is not None else None
     context=dict(report_context or {})
     if strategy_controller is not None:
-        backtest = Backtest.from_prepared(spec, source, strategy=strategy_controller, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars, liquidity=liquidity)
+        backtest = Backtest.from_prepared(spec, source, strategy=strategy_controller, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars, liquidity=liquidity, availability_policy=source.availability_policy)
         result = backtest.run()
         rows = [dict(time=t.time.isoformat(),weights={s:str(w) for s,w in t.weights},rebalance=t.rebalance) for t in backtest.target_log]
         targets_raw = json.dumps(rows,sort_keys=True,separators=(',',':')).encode()
     else:
         targets_raw = Path(targets_path).read_bytes()
         targets = [SpotTarget(**t) for t in json.loads(targets_raw)]
-        backtest = Backtest.from_prepared(spec, source, targets=targets, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars, liquidity=liquidity)
+        backtest = Backtest.from_prepared(spec, source, targets=targets, annualisation_hours=annualisation_hours, retain_diagnostics=retain_diagnostics, execution_delay_bars=execution_delay_bars, liquidity=liquidity, availability_policy=source.availability_policy)
         result = backtest.run()
     report = backtest.performance_report()
-    benchmarks = spot_benchmarks(spec, source, benchmark_weights, annualisation_hours,
+    benchmarks = (spot_benchmarks(spec, source, benchmark_weights, annualisation_hours,
                                  fixed_reference_weights=fixed_reference_weights,liquidity=liquidity)
+                  if source.availability_policy=='strict' else None)
     if source_snapshot()[0] != code_id:
         raise ValueError('Source code changed during the run')
     body = asdict(result)
@@ -126,12 +127,14 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
                    artifact_integrity=dict(status='published_after_export',
                        evidence='manifest.json contains SHA256 of each exported artifact; manifest.sha256 pins that manifest. No report self-hash is embedded.'),
                    benchmark_declaration=dict(buy_and_hold=benchmark_weights,fixed_reference=fixed_reference_weights,
-                                               policy=benchmarks['policy']))
+                                               policy=benchmarks['policy'] if benchmarks is not None else 'Unavailable: no listing/gap benchmark entry policy declared'))
     if data_repository is not None:
         context['input_integrity']['evidence'] = (
             'Actual bars queried via DataRepository; every returned price/identity/time equals the pinned qualified snapshot; '
             'qualified file SHA256 checked on iteration; imported source unchanged after execution')
         context['input_integrity']['access_route'] = 'repository_query_visitor'
+    if source.availability_policy!='strict':
+        context['market_data_availability']=dict(policy=source.availability_policy,events=backtest.availability_audit,optional_analytics='Regular-grid asset/episode analytics unavailable; actual ledger tables retained')
     if liquidity is not None:
         context['liquidity']=dict(data_id=liquidity.data_id,policy=asdict(liquidity.policy),evidence=liquidity.evidence)
     sections=backtest.report_sections(signal_trace=signal_trace)
@@ -139,6 +142,7 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
     destination.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix='.spot-run-', dir=destination.parent))
     try:
+        if source.availability_policy!='strict':(stage/'availability.json').write_text(_json(dict(policy=source.availability_policy,events=backtest.availability_audit)))
         (stage / 'result.json').write_text(_json(body))
         (stage / 'spec.json').write_text(_json(body['spec']))
         (stage / 'targets.json').write_bytes(targets_raw)
@@ -158,7 +162,7 @@ def run_snapshot(snapshot, config, targets_path, destination, *, strategy=None,
                 qualification='Queried bars must exactly equal the qualified price artifact; no fallback')))
         for name, content in (attachments or {}).items():
             if Path(name).name != name or name in ('result.json','spec.json','targets.json','report.json',
-                                                   'target-timing.jsonl','benchmarks.json','research.json','signals.json','execution-trace.jsonl','data-access.json','report.xlsx','source.zip','manifest.json','manifest.sha256'):
+                                                   'target-timing.jsonl','benchmarks.json','research.json','signals.json','execution-trace.jsonl','data-access.json','availability.json','report.xlsx','source.zip','manifest.json','manifest.sha256'):
                 raise ValueError('Invalid or reserved attachment name')
             (stage / name).write_bytes(content() if callable(content) else content)
         with zipfile.ZipFile(stage / 'source.zip', 'w', compression=zipfile.ZIP_DEFLATED) as archive:
@@ -321,7 +325,9 @@ def main(argv=None):
     validate.add_argument('--portable',action='store_true')
     validate.add_argument('--replay',help='Verified portable study; replay through its frozen native repository')
     validate.add_argument('--auxiliary')
-    validate.add_argument('--duckdb')
+    validation_source=validate.add_mutually_exclusive_group()
+    validation_source.add_argument('--duckdb')
+    validation_source.add_argument('--parquet',help='JSON mapping of registered datasets to local Parquet file lists')
     validate.add_argument('--dry-run',action='store_true')
     validate.add_argument('--resolved-plan')
     validate.add_argument('--liquidity')
@@ -345,7 +351,7 @@ def main(argv=None):
     elif args.action == 'validate':
         from .validation import run_validation, replay_validation
         if args.replay:
-            supplied=('snapshot','spec','recipe','plan','duckdb','auxiliary','liquidity',
+            supplied=('snapshot','spec','recipe','plan','duckdb','parquet','auxiliary','liquidity',
                       'liquidity_policy','report_config','resolved_plan','execution_delay_bars')
             if any(getattr(args,name) is not None for name in supplied) or args.dry_run or args.portable or args.trace:
                 parser.error('--replay uses only its frozen study inputs and --output')
@@ -361,13 +367,15 @@ def main(argv=None):
             raise ValueError('Unknown report-config option')
         context=dict(options.get('report_context',{}))
         if 'research_record' in options:context['research_record']=options['research_record']
-        if args.duckdb:
+        if args.duckdb or args.parquet:
             from algoLibs.dao import DataRepository
             from algoLibs.market_data import DuckDBClientManager
-            client=DuckDBClientManager(path=args.duckdb)
+            mapping=json.loads(Path(args.parquet).read_text()) if args.parquet else None
+            client=DuckDBClientManager(path=args.duckdb or ':memory:',parquet_sources=mapping)
             repository=DataRepository(market_data_client_manager=client)
-            context['storage_input']=dict(backend='duckdb',path=str(Path(args.duckdb).resolve()),
-                sha256=digest(args.duckdb),read_only=True)
+            context['storage_input']=(dict(backend='duckdb_parquet',mapping=mapping,
+                files={str(Path(p).resolve()):digest(p) for paths in mapping.values() for p in paths},read_only=True)
+                if mapping is not None else dict(backend='duckdb',path=str(Path(args.duckdb).resolve()),sha256=digest(args.duckdb),read_only=True))
         try:
             result=run_validation(args.snapshot,args.spec,args.recipe,args.plan,args.output,auxiliary_path=args.auxiliary,
                 data_repository=repository,dry_run=args.dry_run,resolved_plan_path=args.resolved_plan,portable=args.portable,

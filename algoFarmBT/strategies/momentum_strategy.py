@@ -343,12 +343,15 @@ class MomentumStrategy(CoreTradingStrategy):
 
     def generate_signal(self, points):
         """The bulk research interface emits desired weights, not order messages."""
-        return [SpotTarget(points[0].time,{p.symbol:p.target_weight for p in points},self.recipe.rebalance)]
+        weights=dict.fromkeys(dict(self.recipe.symbol_budgets),Decimal(0))
+        weights.update({p.symbol:p.target_weight for p in points})
+        return [SpotTarget(points[0].time,weights,self.recipe.rebalance)]
 
     def prepare_targets(self, source, start, end):
         """Emit targets at completed-bar ends, retaining recursive state across chunks."""
         recipe, auxiliary, trace = self.recipe, self.auxiliary, self.trace
         start, end = utc(start), utc(end)
+        observed=getattr(source,'availability_policy','strict')=='observed_hourly_cash_for_unready'
         if start >= end or (end - start) % HOUR:
             raise ValueError('Momentum run needs complete hourly intervals')
         with localcontext() as context:
@@ -356,14 +359,17 @@ class MomentumStrategy(CoreTradingStrategy):
             self._states = states = {symbol: _State(recipe, trace is not None, symbol in self.excluded_symbols, self.excluded_horizons) for symbol, _ in recipe.symbol_budgets}
             self._book = book = _AuxiliaryBook(auxiliary, recipe)
         previous, began = None, False
+        last_seen={}
         for timestamp, rows in groupby(chain.from_iterable(source), key=lambda b: b.start):
             decision = timestamp + HOUR
             if decision >= end:
                 break
             frame = list(rows)
-            if len(frame) != len(states) or {b.symbol for b in frame} != set(states) or any(b.end != decision for b in frame):
+            if ((not observed and (len(frame) != len(states) or {b.symbol for b in frame} != set(states)))
+                    or len({b.symbol for b in frame})!=len(frame) or {b.symbol for b in frame}-set(states)
+                    or any(b.end != decision for b in frame)):
                 raise ValueError('Momentum requires one complete hourly bar per symbol')
-            if previous is not None and timestamp != previous + HOUR:
+            if previous is not None and (timestamp<=previous or (not observed and timestamp != previous + HOUR)):
                 raise ValueError('Momentum state cannot silently bridge missing hours')
             if (decision - start) % HOUR:
                 raise ValueError('Momentum and run boundaries must align')
@@ -371,11 +377,16 @@ class MomentumStrategy(CoreTradingStrategy):
             target = None
             with localcontext() as context:
                 context.prec = 50
+                if observed:
+                    for bar in frame:
+                        if bar.symbol in last_seen and timestamp!=last_seen[bar.symbol]+HOUR:
+                            states[bar.symbol]=_State(recipe,trace is not None,bar.symbol in self.excluded_symbols,self.excluded_horizons)
+                        last_seen[bar.symbol]=timestamp
                 points = self.apply_indicators(frame)
                 if decision >= start:
-                    if not began and decision != start:
+                    if not observed and not began and decision != start:
                         raise ValueError('No completed bar is available at requested run start')
-                    if not all(p.warmup_complete for p in points):
+                    if not observed and not all(p.warmup_complete for p in points):
                         raise ValueError('Insufficient pre-run warmup for the configured recipe')
                     began = True
                     target = self.generate_signal(points)[0]

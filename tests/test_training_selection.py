@@ -38,6 +38,33 @@ class TrainingSelectionTests(unittest.TestCase):
         self.command(output,*options,'--resolved-plan',frozen)
         return output,decode(json.loads((output/'validation.json').read_text())),decode(json.loads(frozen.read_text()))
 
+    def test_validation_parquet_cli_queries_visitor_and_replays_the_saved_native_rows(self):
+        self.inputs()
+        exported=self.root/'bars.parquet'
+        with self.database.transaction(readonly=False) as connection:
+            connection.execute("COPY public.md_bar TO ? (FORMAT PARQUET)",[str(exported)])
+        mapping=self.root/'parquet.json';mapping.write_text(json.dumps({'public.md_bar':[str(exported)]}))
+        self.database.close()
+        output,report,_=self.study('parquet','--parquet',mapping,'--portable')
+        self.assertEqual(report['folds'][0]['status'],'succeeded')
+        audit=decode(json.loads((output/'cases/fold-001/run/data-access.json').read_text()))
+        self.assertTrue(audit['reads'])
+        self.assertTrue(all(r['complete'] for r in audit['reads']))
+        exported.unlink()
+        from algoFarmBT.backtests.validation import replay_validation
+        replay=replay_validation(output,self.root/'offline')
+        self.assertEqual(replay['folds'][0]['status'],'succeeded')
+
+    def test_predeclared_fallback_only_when_successful_trials_have_no_eligible_scores(self):
+        self.inputs();self.plan['selection'].update(minimum_complete_training_days=300,no_eligible_score_fallback='low')
+        self.plan_path.write_text(json.dumps(self.plan))
+        output,report,_=self.study('fallback')
+        selected=report['selections']['fold-001']
+        self.assertTrue(selected['fallback_used'])
+        self.assertEqual(selected['selected_candidate'],'low')
+        self.assertTrue(all(t['status']=='succeeded' and not t['eligible'] for t in selected['trials']))
+        self.assertEqual(report['folds'][0]['status'],'succeeded')
+
     def test_duckdb_training_selects_and_freezes_recipe_before_an_equivalent_ordinary_test(self):
         self.inputs();self.database.close()
         before=datetime.now(timezone.utc)

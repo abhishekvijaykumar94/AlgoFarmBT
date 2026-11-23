@@ -44,6 +44,19 @@ class WalkForwardTests(unittest.TestCase):
             main(['validate','--snapshot',str(self.prices),'--spec',str(self.spec),'--recipe',str(self.recipe),
                   '--plan',str(self.plan_path),'--output',str(destination),*map(str,options)])
 
+    def test_generated_full_history_schedule_keeps_all_folds_and_the_final_tail(self):
+        self.inputs()
+        from algoFarmBT.backtests.validation import _generated_folds
+        self.plan.update(mode='rolling',max_evaluations=257,
+            bounds=dict(start=T.isoformat(),end=(T+81000*H).isoformat()),
+            window=dict(train_bars=768,test_bars=360,step_bars=360,gap_bars=1,partial_final_fold='include'))
+        folds,_=_generated_folds(self.plan,2560)
+        self.assertEqual(len(folds),223)
+        self.assertEqual(utc(folds[-1]['test_end']),T+81000*H)
+        self.assertTrue(all(utc(a['test_end'])==utc(b['test_start']) for a,b in zip(folds,folds[1:])))
+        self.plan['bounds']['end']=(T+100000*H).isoformat()
+        with self.assertRaisesRegex(ValueError,'budget exceeded'):_generated_folds(self.plan,2560)
+
     def test_preview_then_duckdb_holdout_matches_an_ordinary_bounded_run(self):
         self.inputs(); self.database.close()
         preview=self.root/'preview'

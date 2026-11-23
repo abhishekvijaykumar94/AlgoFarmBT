@@ -5,6 +5,7 @@ quote-volume fields are diagnosed but never enter a price-bar snapshot.
 The archive layout and timestamp units follow Binance's public-data README:
 https://github.com/binance/binance-public-data
 """
+from bisect import bisect_right
 import calendar
 import copy
 import csv
@@ -24,6 +25,7 @@ import zipfile
 from algoLibs.backtest.types import SpotBar, number
 from algoLibs.market_data.types import DataRequest, decode, encode, utc
 
+_VALIDATED_INDEX = {}  # Small byte-offset checkpoints; never cached prices.
 HOUR = timedelta(hours=1)
 FIELDS = ('open', 'high', 'low', 'close', 'volume', 'trade_count', 'taker_buy_base_volume')
 DIAGNOSTIC_FIELDS = ('quote_volume', 'taker_buy_quote_volume')
@@ -48,8 +50,66 @@ def local_file(root, name):
     return path
 
 
+class _ReferenceRows(dict):
+    def __init__(self):
+        super().__init__()
+        self.excluded=[]
+
+
+def _observed_archive_rows(root, comparison):
+    """Independently decode actual selected observations; never fill absences."""
+    symbol=comparison['symbol']
+    if not re.fullmatch(r'[A-Z0-9]+',symbol):raise ValueError('Invalid symbol')
+    start,end=(utc(comparison.get('selection_'+k,comparison[k])) for k in ('start','end'))
+    if start>=end or any(t.minute or t.second or t.microsecond for t in (start,end)):
+        raise ValueError('Hourly aligned source selection required')
+    rows=_ReferenceRows();calendars=[]
+    for item in comparison['source_files']:
+        match=re.fullmatch(r'https://data\.binance\.vision/data/spot/(monthly|daily)/klines/'+symbol+r'/1h/('+symbol+r'-1h-(\d{4}-\d{2}(?:-\d{2})?)\.zip)',item['source_url'])
+        if not match or item['file']!=match[2]:raise ValueError('Matching official Spot hourly source required')
+        kind,filename,date=match.groups();pattern='%Y-%m' if kind=='monthly' else '%Y-%m-%d'
+        origin=datetime.strptime(date,pattern).replace(tzinfo=timezone.utc)
+        if origin.strftime(pattern)!=date:raise ValueError('Canonical archive date required')
+        limit=(origin+timedelta(days=calendar.monthrange(origin.year,origin.month)[1]) if kind=='monthly' else origin+timedelta(days=1))
+        calendars.append((origin,limit))
+        path=local_file(root,filename);actual=digest(path);check=local_file(root,filename+'.CHECKSUM').read_text().split()
+        if len(check)!=2 or check[0]!=actual or actual!=item['sha256'] or check[1].lstrip('*')!=filename:
+            raise ValueError('Archive checksum mismatch')
+        if path.stat().st_size>16*1024*1024:raise ValueError('Hourly archive exceeds size limit')
+        with zipfile.ZipFile(path) as archive:
+            if archive.namelist()!=[filename[:-4]+'.csv'] or archive.infolist()[0].file_size>64*1024*1024:
+                raise ValueError('Matching bounded CSV member required')
+            with archive.open(archive.namelist()[0]) as raw:
+                previous=None
+                for values in csv.reader(io.TextIOWrapper(raw,encoding='utf-8-sig')):
+                    if tuple(values)==('open_time','open','high','low','close','volume','close_time','quote_volume','count','taker_buy_volume','taker_buy_quote_volume','ignore'):continue
+                    if len(values)!=12:raise ValueError('Unexpected kline column count')
+                    factor=1000000 if origin.year>=2025 else 1000
+                    def timestamp(value):
+                        seconds,fraction=divmod(int(value),factor)
+                        return datetime.fromtimestamp(seconds,timezone.utc).replace(microsecond=fraction*(1000000//factor))
+                    stamp=timestamp(values[0]);closing=timestamp(values[6])
+                    if not origin<=stamp<limit or (previous is not None and stamp<=previous):
+                        raise ValueError('Unordered or out-of-partition source observation')
+                    previous=stamp
+                    if not start<=stamp<end:continue
+                    if stamp.minute or stamp.second or stamp.microsecond or closing!=stamp+HOUR-timedelta(microseconds=1000000//factor):
+                        rows.excluded.append(dict(time=stamp,reason='invalid_hourly_boundary_or_close',source_url=item['source_url']))
+                        continue
+                    if stamp in rows:raise ValueError('Overlapping duplicate source timestamp')
+                    rows[stamp]=dict(zip(('open','high','low','close','volume','quote_volume','trade_count','taker_buy_base_volume','taker_buy_quote_volume'),
+                        [number(values[i]) for i in (1,2,3,4,5,7,8,9,10)]))
+    covered=start
+    for a,b in sorted(calendars):
+        if a>covered:break
+        covered=max(covered,b)
+    if covered<end:raise ValueError('Source archive calendars do not cover the selection')
+    return rows
+
+
 def archive_rows(root, comparison):
     """Verify checksum, spot source identity, units and a full hourly month."""
+    if 'source_files' in comparison:return _observed_archive_rows(root,comparison)
     symbol = comparison['symbol']
     if not re.fullmatch(r'[A-Z0-9]+', symbol):
         raise ValueError('Invalid symbol')
@@ -112,9 +172,12 @@ def qualify_price_bars(directory, destination):
     native = local_file(root, report['native_file'])
     if digest(native) != report['native_sha256']:
         raise ValueError('Native extraction checksum mismatch')
+    observed=report.get('availability_policy')=='observed_hourly_cash_for_unready'
+    if 'availability_policy' in report and not observed:raise ValueError('Unsupported availability policy')
     comparisons = {}
     for item in report['comparisons']:
-        key = item['symbol'], utc(item['start'])
+        stamp=utc(item['start'])
+        key = item['symbol'], stamp.replace(day=1,hour=0,minute=0,second=0,microsecond=0) if observed else stamp
         if key in comparisons:
             raise ValueError('Duplicate comparison selection')
         comparisons[key] = item
@@ -124,7 +187,9 @@ def qualify_price_bars(directory, destination):
                     native_sha256=report['native_sha256'], verified_native_fields=['ts'] + list(FIELDS),
                     exported_fields=['symbol', 'start', 'end', 'open', 'close'],
                     excluded_fields=list(DIAGNOSTIC_FIELDS), entries=[], sources=[], diagnostics={})
+    if observed:manifest.update(format='qualified-spot-price-bars-v2',availability_policy=report['availability_policy'],availability_exclusions=[])
     seen, streams, counts, previous_times = set(), {}, {}, {}
+    first_times={};gaps={}
     try:
         with native.open() as source:
             def rows():
@@ -140,9 +205,11 @@ def qualify_price_bars(directory, destination):
                 reference = archive_rows(root, comparison)
                 manifest['sources'].append(dict(comparison))
                 symbol = key[0]
+                if observed:manifest['availability_exclusions'].extend(dict(symbol=symbol,**r) for r in getattr(reference,'excluded',()))
                 if symbol not in streams:
                     streams[symbol] = (stage / (symbol + '.jsonl')).open('w')
                     counts[symbol] = 0
+                    gaps[symbol]=[]
                 for _, _, row in group:
                     stamp = utc(row['ts'])
                     if (row['instrument_id'], row['venue_id']) != (comparison['instrument_id'], comparison['venue_id']):
@@ -153,7 +220,9 @@ def qualify_price_bars(directory, destination):
                     if expected is None or any(row.get(k) != expected[k] for k in FIELDS):
                         raise ValueError('Required price-bar fields differ from spot source')
                     if symbol in previous_times and stamp != previous_times[symbol] + HOUR:
-                        raise ValueError('Native hourly gap or ordering error')
+                        if not observed or stamp<=previous_times[symbol]:raise ValueError('Native hourly gap or ordering error')
+                        gaps[symbol].append(dict(start=previous_times[symbol]+HOUR,end=stamp))
+                    first_times.setdefault(symbol,stamp)
                     if not utc(report['start']) <= stamp < utc(report['end']):
                         raise ValueError('Native row is outside artifact bounds')
                     previous_times[symbol] = stamp
@@ -175,10 +244,11 @@ def qualify_price_bars(directory, destination):
         for symbol, stream in streams.items():
             stream.close()
             expected = int((utc(report['end']) - utc(report['start'])) / HOUR)
-            if counts[symbol] != expected:
+            if not observed and counts[symbol] != expected:
                 raise ValueError('Incomplete per-symbol artifact coverage')
             filename = symbol + '.jsonl'
             manifest['entries'].append(dict(symbol=symbol, file=filename, rows=counts[symbol], sha256=digest(stage / filename)))
+            if observed:manifest['entries'][-1].update(first_observed=first_times[symbol],end=previous_times[symbol]+HOUR,gaps=gaps[symbol])
         raw = _json(manifest).encode()
         (stage / 'manifest.json').write_bytes(raw)
         (stage / 'manifest.sha256').write_text(hashlib.sha256(raw).hexdigest() + '\n')
@@ -206,8 +276,12 @@ class QualifiedSpotSource:
             raise ValueError('Price-bar manifest hash mismatch')
         self.data_id = 'sha256:' + expected
         self._manifest = decode(json.loads(raw))
-        if self._manifest['format'] != 'qualified-spot-price-bars-v1':
+        if self._manifest['format'] not in ('qualified-spot-price-bars-v1','qualified-spot-price-bars-v2'):
             raise ValueError('Unsupported price-bar artifact')
+        self.availability_policy=self._manifest.get('availability_policy','strict')
+        if self.availability_policy not in ('strict','observed_hourly_cash_for_unready'):
+            raise ValueError('Unsupported source availability policy')
+        self.asset_first_observed={e['symbol']:utc(e['first_observed']) for e in self._manifest['entries']} if self.availability_policy!='strict' else {}
         self.bounds = tuple(utc(t) for t in bounds) if bounds is not None else None
         if self.bounds is not None:
             start, end = self.bounds
@@ -291,6 +365,7 @@ class QualifiedSpotSource:
 
     def _file_batches(self):
         manifest = self._manifest
+        observed=self.availability_policy!='strict'
         entries = manifest['entries']
         if not entries or len({e['symbol'] for e in entries}) != len(entries):
             raise ValueError('Unique nonempty artifact entries required')
@@ -298,27 +373,46 @@ class QualifiedSpotSource:
             if digest(local_file(self.directory, entry['file'])) != entry['sha256']:
                 raise ValueError('Price-bar data hash mismatch')
         def read(entry):
-            previous, count, selected = None, 0, 0
-            with local_file(self.directory, entry['file']).open() as stream:
+            path=local_file(self.directory,entry['file'])
+            key=(str(path.resolve()),entry['sha256'],_json(entry),_json((manifest['start'],manifest['end'],self.availability_policy)))
+            if key not in _VALIDATED_INDEX:
+                previous=None;first=None;count=0;gaps=[];checkpoints=[]
+                with path.open('rb') as stream:
+                    while True:
+                        offset=stream.tell();line=stream.readline()
+                        if not line:break
+                        bar=SpotBar(**decode(json.loads(line)))
+                        if bar.symbol!=entry['symbol'] or bar.end-bar.start!=HOUR:
+                            raise ValueError('Unexpected artifact symbol or interval')
+                        if not utc(manifest['start'])<=bar.start<bar.end<=utc(manifest['end']):
+                            raise ValueError('Artifact row outside declared bounds')
+                        if previous is not None:
+                            if bar.start<=previous or (not observed and bar.start!=previous+HOUR):
+                                raise ValueError('Artifact gap or ordering error')
+                            if bar.start!=previous+HOUR:gaps.append(dict(start=previous+HOUR,end=bar.start))
+                        if count%1024==0:checkpoints.append((bar.start,offset))
+                        first=first or bar.start;previous=bar.start;count+=1
+                if count!=entry['rows'] or not count:raise ValueError('Artifact row count mismatch')
+                if observed and (first!=utc(entry['first_observed']) or previous+HOUR!=utc(entry['end']) or gaps!=entry['gaps']):
+                    raise ValueError('Artifact availability metadata differs from observed rows')
+                if len(_VALIDATED_INDEX)>=32:_VALIDATED_INDEX.pop(next(iter(_VALIDATED_INDEX)))
+                _VALIDATED_INDEX[key]=checkpoints
+            checkpoints=_VALIDATED_INDEX[key]
+            start,end=self.bounds or (utc(manifest['start']),utc(manifest['end']))
+            index=max(0,bisect_right([t for t,_ in checkpoints],start)-1)
+            selected=0
+            with path.open('rb') as stream:
+                stream.seek(checkpoints[index][1])
                 for line in stream:
-                    bar = SpotBar(**decode(json.loads(line)))
-                    if bar.symbol != entry['symbol'] or bar.end - bar.start != HOUR:
-                        raise ValueError('Unexpected artifact symbol or interval')
-                    if not utc(manifest['start']) <= bar.start < bar.end <= utc(manifest['end']):
-                        raise ValueError('Artifact row outside declared bounds')
-                    if previous is not None and bar.start != previous + HOUR:
-                        raise ValueError('Artifact gap or ordering error')
-                    previous = bar.start
-                    count += 1
-                    if self.bounds is None or self.bounds[0] <= bar.start < self.bounds[1]:
-                        if self.bounds is not None and (bar.start != self.bounds[0]+selected*HOUR or bar.end > self.bounds[1]):
-                            raise ValueError('Incomplete or unaligned bounded price coverage')
-                        selected += 1
-                        yield bar
-            if self.bounds is not None and selected != int((self.bounds[1]-self.bounds[0])/HOUR):
+                    bar=SpotBar(**decode(json.loads(line)))
+                    if bar.start>=end:break
+                    if bar.start<start:continue
+                    if not observed and bar.start!=start+selected*HOUR:
+                        raise ValueError('Incomplete or unaligned bounded price coverage')
+                    selected+=1
+                    yield bar
+            if not observed and self.bounds is not None and selected!=int((end-start)/HOUR):
                 raise ValueError('Incomplete bounded price coverage')
-            if count != entry['rows']:
-                raise ValueError('Artifact row count mismatch')
         batch = []
         for bar in heapq.merge(*(read(e) for e in entries), key=lambda b: (b.start, b.symbol)):
             batch.append(bar)

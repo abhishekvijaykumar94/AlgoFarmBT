@@ -59,4 +59,4 @@ def case_metrics(folder, row):
                 order_count=len(orders),unfilled_order_count=sum(o['filled_quantity']==0 for o in orders),
                 partial_order_count=sum(0<o['filled_quantity']<o['requested_quantity'] for o in orders),
                 censored_decision_count=schedule['censored'],
-                same_fill_break_even_fee_bps=research['sections']['trades']['statistics']['same_fill_break_even_fee_bps'])
+                same_fill_break_even_fee_bps=research['sections'].get('trades',{}).get('statistics',{}).get('same_fill_break_even_fee_bps'))

@@ -148,7 +148,7 @@ def replay_validation(study, destination):
         report=run_validation(common/'prices',common/'spec.json',common/'recipe.json',common/'plan.json',output,
             resolved_plan_path=stage/'preview/resolved-plan.json',**kwargs)
         stable={'result.json','spec.json','targets.json','target-timing.jsonl','report.json','signals.json',
-                'benchmarks.json','execution-trace.jsonl','calculation-trace.jsonl','recipe.json','selected-recipe.json','recipe-schedule.json'}
+                'benchmarks.json','availability.json','execution-trace.jsonl','calculation-trace.jsonl','recipe.json','selected-recipe.json','recipe-schedule.json'}
         hashes={}
         for name,sha in manifest['files'].items():
             if name.startswith('cases/') and Path(name).name in stable:
@@ -182,7 +182,7 @@ def _candidate_recipes(selection, raw_recipe):
     """Resolve a finite predeclared recipe search with the existing loader."""
     from ..strategies.momentum_strategy import load_recipe
     expected={'rule','objective','minimum_complete_training_days','tie_break','candidate_failure_policy','candidates'}
-    if not isinstance(selection,dict) or set(selection)!=expected or selection['rule']!='training_rank':
+    if not isinstance(selection,dict) or set(selection)-{'no_eligible_score_fallback'}!=expected or selection['rule']!='training_rank':
         raise ValueError('Explicit supported training selection fields required')
     if selection['objective'] not in ('net_return','annualised_daily_sharpe'):
         raise ValueError('Unsupported canonical training objective')
@@ -215,6 +215,9 @@ def _candidate_recipes(selection, raw_recipe):
             if sha in hashes:raise ValueError('Duplicate resolved candidate recipes')
             ids.add(identity);hashes.add(sha)
             result.append(dict(id=identity,recipe=json.loads(content),recipe_sha256=sha,warmup_bars=resolved.warmup_bars))
+    fallback=selection.get('no_eligible_score_fallback')
+    if fallback is not None and fallback not in ids:
+        raise ValueError('Fallback must name a predeclared candidate')
     return result
 
 
@@ -241,7 +244,7 @@ def _generated_folds(plan, warmup):
         raise ValueError('Test windows must not overlap')
     if window['partial_final_fold'] not in ('drop','include','reject'):
         raise ValueError('Explicit partial_final_fold policy required')
-    maximum=1056 if plan['selection_rule']=='training_rank' else 32
+    maximum=1056 if plan['selection_rule']=='training_rank' else 257
     if type(plan['max_evaluations']) is not int or not 1<=plan['max_evaluations']<=maximum:
         raise ValueError('Evaluation budget must be 1 to '+str(maximum))
     hour=timedelta(hours=1)
@@ -256,7 +259,7 @@ def _generated_folds(plan, warmup):
             if window['partial_final_fold']=='drop':break
             if window['partial_final_fold']=='reject':raise ValueError('Partial final test window rejected')
             test_end=end
-        if len(folds)>=min(32,plan['max_evaluations']):
+        if len(folds)>=min(256,plan['max_evaluations']):
             raise ValueError('Evaluation budget exceeded before trials')
         fold=dict(id='fold-%03d'%(len(folds)+1),designation=plan['designation'],development_start=train_start.isoformat(),
             development_end=train_end.isoformat(),calibration_end=train_end.isoformat(),selected_at=train_end.isoformat(),
@@ -322,8 +325,8 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
     evaluation_count=(len(folds)*(len(candidates)+1) if ranking else len(folds))+int(continuous)
     if generated and evaluation_count>plan['max_evaluations']:
         raise ValueError('Evaluation budget exceeded before trials')
-    if not isinstance(folds,list) or not 1<=len(folds)<=32:
-        raise ValueError('Declare 1 to 32 chronological folds')
+    if not isinstance(folds,list) or not 1<=len(folds)<=(256 if generated else 32):
+        raise ValueError('Declare 1 to 256 generated or 32 explicit chronological folds')
     ids=[r['id'] for r in folds]
     if any(not isinstance(i,str) or not re.fullmatch('[a-z][a-z0-9-]{0,47}',i) for i in ids) or len(ids)!=len(set(ids)):
         raise ValueError('Unique safe fold IDs required')
@@ -372,7 +375,7 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
     if generated:
         from algoLibs.backtest import Backtest
         # Reuse the engine's constructor contract before any trial executes.
-        Backtest.from_prepared(base_spec,source,targets=(),execution_delay_bars=execution_delay_bars,liquidity=liquidity)
+        Backtest.from_prepared(base_spec,source,targets=(),execution_delay_bars=execution_delay_bars,liquidity=liquidity,availability_policy=source.availability_policy)
     options=dict(execution_delay_bars=execution_delay_bars,retain_trace=retain_trace,
         fixed_reference_weights=fixed_reference_weights,report_context=report_context,
         liquidity_policy=liquidity_policy,liquidity_data_id=liquidity.data_id if liquidity else None)
@@ -504,7 +507,11 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
                 # Arithmetic on Decimal scores would round under the caller's context.
                 valid.sort(key=lambda t:t['score'],reverse=True)
                 winner=valid[0] if valid and all(t['status']=='succeeded' for t in trials) else None
-                selection=dict(schema='walk-forward-selection-v1',status='selected' if winner else 'failed',
+                fallback_used=False
+                if winner is None and not valid and all(t['status']=='succeeded' for t in trials) and policy.get('no_eligible_score_fallback'):
+                    winner=next(t for t in trials if t['case_id']==policy['no_eligible_score_fallback'])
+                    fallback_used=True
+                selection=dict(fallback_used=fallback_used,fallback_policy=policy.get('no_eligible_score_fallback'),schema='walk-forward-selection-v1',status='selected' if winner else 'failed',
                     evidence_kind='historical_walk_forward',training_data_cutoff=window['train_end'],
                     simulated_selection_cutoff=utc(fold['selected_at']),performed_at=datetime.now(timezone.utc),
                     train_start=window['train_start'],test_start=window['test_start'],test_end=window['test_end'],

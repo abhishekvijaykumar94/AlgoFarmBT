@@ -504,3 +504,31 @@ routes. Replay compares continuous financial evidence, execution decisions,
 signals and recipe-schedule hashes while retaining actual backend provenance and
 execution times. The target-input interface of the same ordinary Backtest is the
 reference for continuous-account comparisons.
+
+Full-history hourly studies can opt in through a `qualified-spot-price-bars-v2`
+source with `availability_policy: observed_hourly_cash_for_unready`. The ordinary
+momentum controller resets each asset's indicators after its own source gap and
+keeps its original allocation budget in cash until its declared warmup completes.
+Later listings never receive invented earlier observations. The ordinary Backtest
+carries one account, cancels unavailable openings, sizes resumed decisions at
+observed openings, and records only observed complete active-universe closes.
+`availability.json` records cancellations, source gaps, and unvalued terminal
+intervals. The report identifies its actual terminal valuation time; incomplete
+UTC days do not enter daily risk statistics. Regular-grid asset/episode analytics
+and listing-dependent benchmarks are unavailable under this policy; raw holdings,
+fills, targets, cash, cost basis, P&L, fees, and the canonical reports remain saved.
+Strict contiguous fixed-universe behavior remains the default.
+
+Generated v2 schedules support at most 256 folds (257 evaluations for a frozen
+continuous control), with the existing 1056 total evaluation limit for ranking.
+Use `partial_final_fold: include` to retain the last partial test window.
+`validate --parquet mapping.json` uses the same DataRepository/DuckDB visitor as
+`--duckdb`; mappings contain registered dataset names and local Parquet file lists.
+Portable studies freeze queried native rows for offline replay.
+
+Training selection may explicitly declare `no_eligible_score_fallback` naming one
+of its predeclared candidates. It is used only if every training execution succeeds
+but none has an eligible finite score. Each trial's reason and `fallback_used` are
+retained. Runtime/integrity failures still fail the fold, and omitting this option
+preserves the existing fail-on-no-eligible-score behavior. This is a historical
+research convention, not evidence that the fallback was selected by performance.
