@@ -168,6 +168,13 @@ class MomentumRecipe:
         if not all(isinstance(v, str) and v for v in self.assumptions):
             raise ValueError('Assumptions must be explicit text entries')
 
+    def validate_availability(self, policy):
+        """Check the source policy against this recipe's existing calculation contract."""
+        if policy not in ('strict','observed_hourly_cash_for_unready','observed_hourly_preserve_state_v1'):
+            raise ValueError('Unsupported momentum availability policy')
+        if policy=='observed_hourly_preserve_state_v1' and (self.rv_estimator!='ewma_zero_mean_variance' or self.return_kind!='log'):
+            raise ValueError('Elapsed-time gap policy requires log returns and zero-mean EWMA variance')
+
 
 class _AuxiliaryBook:
     def __init__(self, observations, recipe):
@@ -352,11 +359,9 @@ class MomentumStrategy(CoreTradingStrategy):
         recipe, auxiliary, trace = self.recipe, self.auxiliary, self.trace
         start, end = utc(start), utc(end)
         policy=getattr(source,'availability_policy','strict')
-        if policy not in ('strict','observed_hourly_cash_for_unready','observed_hourly_preserve_state_v1'):raise ValueError('Unsupported momentum availability policy')
+        recipe.validate_availability(policy)
         observed=policy in ('observed_hourly_cash_for_unready','observed_hourly_preserve_state_v1')
         preserve=policy=='observed_hourly_preserve_state_v1'
-        if preserve and (recipe.rv_estimator!='ewma_zero_mean_variance' or recipe.return_kind!='log'):
-            raise ValueError('Elapsed-time gap policy requires log returns and zero-mean EWMA variance')
         if start >= end or (end - start) % HOUR:
             raise ValueError('Momentum run needs complete hourly intervals')
         with localcontext() as context:

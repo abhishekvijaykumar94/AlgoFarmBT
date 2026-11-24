@@ -43,7 +43,7 @@ both training endpoints by the step; expanding keeps the first training start.
 Holdout resolves one fold. Test intervals cannot overlap; a step larger than the
 test length permits gaps. The final partial test policy is `drop`, `include` or
 `reject`. A schedule must produce at least one fold and fit its explicit
-`max_evaluations` budget (at most 32 test runs).
+`max_evaluations` budget (at most 256 generated folds; total-budget limits are described below).
 
 `restart_from_declared_warmup` restarts each test's features exactly
 `recipe.warmup_bars` hours before its first decision. Training coverage is also
@@ -107,10 +107,11 @@ come from the same run specification. Mathematical recipe parameters and warmup
 may vary. Auxiliary observations must satisfy every candidate's ordinary source,
 freshness and field-consumer contracts; failed trials remain visible.
 
-There are at most 32 folds. The explicit total evaluation budget counts one run
+There are at most 256 generated folds. The explicit total evaluation budget counts one run
 per training candidate plus one test per fold, even when failure later prevents
-a test. Training-selection budgets range from 1 to 1056; frozen controls retain
-their 32-run bound. Preview freezes each candidate's exact training/test history
+a test. V2 training-selection budgets range from 1 to 1056; frozen controls permit
+at most 257 evaluations, including an optional continuous account. V3 grid
+budgets are described below. Preview freezes each candidate's exact training/test history
 bounds and fully resolved recipe hash. Coverage uses the maximum required history,
 while each child receives exactly its own recipe's declared warmup.
 
@@ -546,3 +547,211 @@ The same policy applies to training, test and continuous accounts:
 * Residual intervals of at least 24 hours are listed for research review in the source manifest. This threshold is a review convention, not an automatic liquidation/reset rule. A larger outage may justify changing the research universe or rebuilding state from validated history; that decision must be explicit and versioned.
 
 Sparse-source reports retain the financial ledger and availability audit. Regular-grid optional analytics and benchmarks without a declared gap/listing entry policy remain unavailable. Run results must be interpreted with these limitations. The original sealed study is retained; repaired inputs and policy changes produce a new data identity and new result directory.
+
+
+## Basic grid declarations (v3)
+
+The existing `validate` command accepts `chronological-validation-v3` with
+`selection_rule: training_rank`. Declare exactly one of `selection.candidates`
+(the existing explicit list) or `selection.search`:
+
+```json
+"search": {
+  "method": "grid",
+  "parameters": {
+    "smoothing_span": [3, 6],
+    "signal_span": [6, 9]
+  }
+}
+```
+
+These arbitrary values illustrate mechanics only. The complete example is
+`examples/momentum.grid-validation.json`: a holdout with four training candidates
+and one selected test (five logical evaluations). It is development research,
+not a recommendation or new unseen evidence. Supply qualified prices covering
+its declared history and scoring windows, the matching run specification, and
+the pinned baseline recipe. For a synthetic fixture, the public CLI integration
+tests in `tests/test_grid_validation.py` provide qualified temporary DuckDB bars.
+The same four candidates could be listed explicitly; one-point and four-point
+grids are checked for identical financial artifacts against such controls.
+
+```sh
+python -m algoFarmBT.backtests.execute_momentum_backtest validate \
+  --snapshot qualified-prices --duckdb prices.duckdb \
+  --spec run.json --recipe examples/momentum.baseline.json \
+  --plan examples/momentum.grid-validation.json --output grid-preview --dry-run
+
+python -m algoFarmBT.backtests.execute_momentum_backtest validate \
+  --snapshot qualified-prices --duckdb prices.duckdb \
+  --spec run.json --recipe examples/momentum.baseline.json \
+  --plan examples/momentum.grid-validation.json --output grid-study \
+  --resolved-plan grid-preview/resolved-plan.json
+```
+
+Each axis must be a nonempty list; list-valued recipe fields need a list of
+whole field values (for example, each `horizons` choice is an entire horizon
+list). Cardinality is checked before expansion or market-data reads. The framework
+retains 32 candidates and 256 generated folds. V3 accepts an explicit budget
+up to 8,449 logical evaluations; v2 retains its 1,056 training-selection ceiling.
+Budgets count every candidate plus its selected test per fold, and any
+continuous account. The budget is a ceiling, not a request to launch extra runs.
+
+Parameter names are enumerated in sorted order and declared value order is
+preserved. Every combination uses `load_recipe` and the existing comparison
+checks. Costs, capital, universe, allocation and annualisation remain fixed.
+Invalid recipes, unknown fields, equivalent resolved recipes (including `.50`
+and `.5`), and ID collisions reject the preview; invalid grid combinations are
+identified by coordinates. V3 also preflights the strategy's source-policy
+contract: the elapsed-time gap policy requires log returns and zero-mean EWMA
+variance. V1/v2 interpretation and recipe hashing are preserved.
+
+The preview retains the original grid and input hashes, every complete recipe
+and default, full recipe SHA256, `grid-` plus its first 40 hex characters as the
+safe ID, coordinates, exact candidate history/scoring windows and evaluation
+count. Parameter-key order does not change candidate identity. Changed input
+bytes require a fresh preview even when the candidate identities are unchanged.
+An optional `no_eligible_score_fallback` must name an ID from the preview; edit
+the plan and preview again to freeze that declaration before execution.
+
+Execution remains sequential through `run_related_cases`, `run_momentum`, the
+existing strategy and Backtest ledger. Canonical `case_metrics` supplies scores;
+the existing eligibility checks, full-hash tie break and fail-fold policy still
+apply. Ordinary trial `case.json` receipts retain coordinates and each run keeps
+signals, targets, fills, fees, reports and repository access receipts. A runtime
+failure remains visible and gates the fold's selected test. The resolved plan
+contains the same grid metadata used by the JSON and workbook views below.
+
+
+## Budgeted full-history grids and continuous accounts (ticket 2)
+
+For `F` folds and `C` candidates, declare at least `F * (C + 1)` evaluations,
+plus one when `capital_policy` is `continuous_account`. The maximum is
+`256 * (32 + 1) + 1 = 8449`. Four candidates over 217 folds require 868 training
+runs, 217 selected tests and one continuous account: 1,086 evaluations. Twenty-seven
+candidates over the same folds require 6,077. These are workload examples, not
+recommended trading grids. Rejections occur before trial directories/accounts
+are created; history, candidates and the final partial fold are never silently
+trimmed to make a study fit. V1/v2 financial behavior and the v2 ceiling remain
+unchanged.
+
+Use the same preview/execute commands above with the full qualified source bounds,
+chosen window sizes, `partial_final_fold: include` when the final tail is wanted,
+and a sufficient `max_evaluations`. Preview records each fold, candidate history
+window, source qualification, original grid and input/code hashes. Inspect and
+freeze the exact parameter values and budget before execution. Coverage depends
+on those bounds and windows; the evaluation budget does not cap the number of
+hourly observations. A software preview does not authorize a large research sweep.
+
+The ordinary selected-test runs remain reset-account diagnostics. The additional
+continuous run uses the existing recipe schedule and one Backtest/Portfolio
+account: cash, holdings and cost basis carry across recipe switches. Existing
+uniform execution delays keep pending prior decisions across switches; only
+account-end decisions are censored. Equity curves from reset accounts are never
+concatenated into that portfolio. Fees and lot/tick rounding use the ordinary
+ledger. Qualification, later asset inception, candidate-specific observed-bar
+warmup and missing-open cancellation use the existing source/strategy/account
+policies. No grid-specific signal, allocation or execution logic is added.
+
+V3 named fallback must reference a resolved candidate ID from a preview and be
+refrozen before execution. A fallback is used only when all training runs succeed
+but none has an eligible score. It remains explicitly labelled in the selection
+receipt; its test and continuous-account results are development evidence with
+`operational_fallback` eligibility reasons and cannot enter eligible research
+performance. A failed required candidate cannot trigger this fallback. Fail-fold
+receipts preserve successful siblings, prevent that fold's selected test and gate
+the continuous account. Without an eligible score or a declared fallback, no
+selected test runs. Unknown/inspected-history safeguards remain in effect.
+
+`tests/test_grid_continuous_validation.py` exercises the public CLI using the
+existing temporary DuckDB fixture. It checks budget/count boundaries, explicit-grid
+financial parity, a later asset inception and residual gaps, delayed switch
+intents, native query cutoffs, future-price mutation, fallback classification and
+failure gating. It also reuses the retained assertion-only Fraction/integer
+ledger audit (`tests/spot_ledger_audit.py`) to verify fills, fees, cash, cost basis,
+positions and marks against ordinary-run evidence; the audit never generates
+signals, orders or an alternative account simulation.
+
+
+## Inspecting and replaying grid studies (ticket 3)
+
+V3 reports carry `candidate_search`: the original search declaration, searched
+parameter names, every candidate ID/full recipe hash, original coordinates,
+complete resolved recipe/defaults, typed parameter values and workload summary.
+`parameters` contains resolved values for all searched dimensions; explicit
+candidates that omit a dimension show its actual default. Candidate identities
+and recipe hashes retain their established meaning. All dimensions are shown as
+columns in the candidate/training tables, including one-valued axes.
+
+The existing workbook exporter adds **Grid summary** and **Candidates** tables.
+**Training** shows `parameter.*` columns beside canonical scores, fees, turnover,
+drawdown, complete-day coverage, eligibility and error reasons. Its links open
+ordinary run reports, candidate receipts or failure receipts. **Selection** shows
+only the recipe selected for each forward window, its parameters, fallback label,
+designation/eligibility and links to the selection receipt and selected-test
+report. **Folds** remains the selected-test evidence; **Continuous account** and
+**Recipe switches** remain separate when requested. Training rankings do not
+supply forward-test results for unselected candidates. `selection_scope: per_fold`
+identifies a schedule of local choices rather than a single globally optimal
+parameter vector. **Run details** retains inspection and dependent-trial history;
+new candidate counts do not become an effective independent-trial estimate.
+
+Prepare portable studies with the same public command and native repository
+option used for normal validation. Both preview and execution receive
+`--portable`, and matching optional auxiliary/liquidity, delay, trace and report
+configuration inputs:
+
+```sh
+python -m algoFarmBT.backtests.execute_momentum_backtest validate \
+  --snapshot qualified-prices --parquet parquet.json \
+  --spec run.json --recipe examples/momentum.baseline.json \
+  --plan examples/momentum.grid-validation.json --portable --trace \
+  --output grid-preview --dry-run
+
+python -m algoFarmBT.backtests.execute_momentum_backtest validate \
+  --snapshot qualified-prices --parquet parquet.json \
+  --spec run.json --recipe examples/momentum.baseline.json \
+  --plan examples/momentum.grid-validation.json --portable --trace \
+  --resolved-plan grid-preview/resolved-plan.json --output grid-study
+
+python -m algoFarmBT.backtests.execute_momentum_backtest validate \
+  --replay grid-study --output grid-replayed
+```
+
+`--duckdb prices.duckdb` can replace `--parquet parquet.json`. Portable capture
+uses the existing repository preparation and bounded native requests. Replay
+uses `SnapshotReader.repository`, query objects and snapshot visitor dispatch,
+so original database/Parquet files and mappings may be unavailable. The qualified
+price oracle and source/native/input inventories remain in the bundle. Original
+storage provenance stays recorded; replay records `native_snapshot` provenance
+and actual execution/selection times. Canonical financial, signal and parameter
+artifacts must reproduce under the existing comparison rules. Workbook bytes
+containing actual execution times need not match.
+
+Before any replay account runs, the existing replay workflow checks file hashes,
+inventories and the frozen-plan checksum pair, verifies archived source members/content against the running
+source identity, binds common candidate recipes and per-trial/selection receipts
+to the frozen metadata, and deterministically resolves the original declaration
+again through the ordinary recipe loader. The re-expanded definition must match
+the retained candidate list, defaults, windows and input identities. Changed
+source inventories, recipes, coordinates, selected parameters or frozen metadata
+fail visibly, including contradictory artifacts whose outer checksums were
+recomputed. Financial outcomes are then recomputed and checked using the existing
+financial/artifact comparisons. Integrity receipts enforce consistency; they are
+not signatures authenticating a study's author. Use the archived source version
+and matching dependencies when the running source differs.
+
+For named fallback, preview to obtain the stable member ID, add it as
+`no_eligible_score_fallback`, then create a **fresh** preview and execute that
+frozen definition. Replay retains its operational fallback label and development
+classification. Runtime failures retain successful siblings and failure receipts;
+replay does not invent a selected test for a failed fold. V3 retains the 32-candidate,
+256-fold and 8,449-evaluation bounds described above; v2 keeps its existing
+1,056 training-selection ceiling. No new result database is required.
+
+Candidate proposal remains separate from execution: grid declarations resolve
+into the same candidate records as explicit lists; `run_related_cases` and the
+existing momentum/Backtest workflow execute them, and `case_metrics` supplies the
+scores. A future Bayesian proposal method can build on that boundary with
+training-only feedback and its own reproducible proposal receipts. Adaptive
+search, parallel workers, resume infrastructure and allocation changes are
+outside this implementation.

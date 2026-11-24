@@ -14,7 +14,7 @@ KNOWN_EXPOSURES = (
 )
 
 
-def eligibility_reasons(fold, plan, symbols):
+def eligibility_reasons(fold, plan, symbols, *, selection=None):
     start,end=utc(fold['test_start']),utc(fold['test_end'])
     reasons=[]
     if fold['designation']!='test':reasons.append('development')
@@ -23,4 +23,6 @@ def eligibility_reasons(fold, plan, symbols):
     elif utc(cutoff)>start:reasons.append('declared_inspected_history')
     if any(set(symbols)&set(e['symbols']) and start<utc(e['end']) and utc(e['start'])<end for e in KNOWN_EXPOSURES):
         reasons.append('previously_inspected')
+    if plan.get('schema')=='chronological-validation-v3' and selection and selection.get('fallback_used'):
+        reasons.append('operational_fallback')
     return reasons

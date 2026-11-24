@@ -4,6 +4,7 @@ from datetime import timedelta
 from datetime import datetime, timezone
 from dataclasses import asdict
 import json
+from itertools import product
 import hashlib
 import copy
 import math
@@ -115,6 +116,55 @@ def _financial_evidence(report):
     return _json(report)
 
 
+def _search_evidence(plan, candidates, fold_count, evaluation_count, training_trial_count):
+    """Retain proposal metadata alongside the existing execution evidence."""
+    search=plan['selection'].get('search')
+    return dict(method='grid' if search else 'explicit',
+        declaration=copy.deepcopy(search) if search else dict(method='explicit',candidates=plan['selection']['candidates']),
+        parameter_names=sorted(candidates[0]['parameters']),candidates=candidates,
+        summary=dict(candidate_count=len(candidates),fold_count=fold_count,planned_evaluation_count=evaluation_count,
+            training_trial_count=training_trial_count,objective=plan['selection']['objective'],
+            ranking_phase='training',selection_scope='per_fold',test_evidence='selected_recipes_only'))
+
+
+def _verify_candidate_metadata(study, original, report, inventory):
+    """Bind retained recipe/selection receipts to the frozen candidate records."""
+    def retained(name):
+        if name not in inventory:
+            raise ValueError('Retained candidate metadata references an unlisted artifact: '+name)
+        return study/name
+    candidates=original.get('candidates',[])
+    if not candidates:return
+    if original['plan']['schema']=='chronological-validation-v3':
+        expected=_search_evidence(original['plan'],candidates,len(original['folds']),original['evaluation_count'],
+                                  sum(len(s['trials']) for s in report['selections'].values()))
+        if _json(report.get('candidate_search'))!=_json(expected):
+            raise ValueError('Retained candidate metadata differs from frozen definition')
+    by_id={c['id']:c for c in candidates}
+    for candidate in candidates:
+        if digest(retained('common/candidates/'+candidate['id']+'.json'))!=candidate['recipe_sha256']:
+            raise ValueError('Retained candidate recipe differs from frozen metadata: '+candidate['id'])
+    for fold,selection in report.get('selections',{}).items():
+        folder=retained('cases/'+fold+'/selection.json')
+        if _json(_read(folder))!=_json(selection):
+            raise ValueError('Retained candidate metadata differs in selection receipt: '+fold)
+        if [t['case_id'] for t in selection['trials']]!=[c['id'] for c in candidates]:
+            raise ValueError('Retained candidate metadata omits or reorders training trials: '+fold)
+        for trial in selection['trials']:
+            candidate=by_id[trial['case_id']]
+            case=retained('cases/'+fold+'/training/'+trial['artifacts']+'/case.json')
+            if (_json(_read(case))!=_json(candidate) or trial['recipe_sha256']!=candidate['recipe_sha256']
+                    or _json(trial.get('parameters'))!=_json(candidate.get('parameters'))):
+                raise ValueError('Retained candidate metadata differs in training receipt: '+fold)
+        identity=selection['selected_candidate']
+        if identity is not None:
+            candidate=by_id[identity]
+            selected=retained('cases/'+fold+'/selected-recipe.json')
+            if (digest(selected)!=candidate['recipe_sha256'] or selection['selected_recipe_sha256']!=candidate['recipe_sha256']
+                    or _json(selection.get('selected_parameters'))!=_json(candidate.get('parameters'))):
+                raise ValueError('Retained candidate metadata differs in selected recipe: '+fold)
+
+
 def replay_validation(study, destination):
     """Verify a portable study, then use the same validation runner offline."""
     from algoLibs.market_data.snapshots import SnapshotReader
@@ -122,10 +172,28 @@ def replay_validation(study, destination):
     if destination.exists():raise FileExistsError(destination)
     source_sha=digest(study/'manifest.json')
     manifest=_verified_validation(study)
+    if digest(study/'resolved-plan.json')!=(study/'resolved-plan.sha256').read_text().strip():
+        raise ValueError('Frozen resolved plan checksum differs from retained definition')
     original=_read(study/'resolved-plan.json')
     if not original['options'].get('portable'):
         raise ValueError('Replay requires a portable native validation study')
+    code_id,code_files=source_snapshot()
+    try:
+        with zipfile.ZipFile(study/'source.zip') as archive:
+            entries=archive.infolist()
+            if (manifest['code_id']!=code_id or len(entries)!=len(code_files)
+                    or {entry.filename for entry in entries}!=set(code_files)
+                    or any(entry.file_size!=len(code_files[entry.filename])
+                           or archive.read(entry)!=code_files[entry.filename] for entry in entries)):
+                raise ValueError('Replay source inventory or code differs; use the archived source')
+    except (zipfile.BadZipFile,KeyError) as error:
+        raise ValueError('Replay source inventory is invalid') from error
     common=study/'common';native=common/'native-market-data'
+    old_report=_read(study/'validation.json')
+    try:
+        _verify_candidate_metadata(study,original,old_report,manifest['files'])
+    except (KeyError,TypeError,IndexError,OSError) as error:
+        raise ValueError('Retained candidate metadata is invalid') from error
     snapshot=SnapshotReader(native)
     options=original['options']
     context=dict(options['report_context'] or {})
@@ -155,7 +223,6 @@ def replay_validation(study, destination):
                 if not (output/name).is_file() or digest(output/name)!=sha:
                     raise ValueError('Replay deterministic artifact differs: '+name)
                 hashes[name]=dict(original=sha,replay=digest(output/name))
-        old_report=_read(study/'validation.json')
         if _financial_evidence(report)!=_financial_evidence(old_report):
             raise ValueError('Replay suite financial evidence differs')
         if [r['status'] for r in report['folds']]!=[r['status'] for r in old_report['folds']]:
@@ -171,17 +238,33 @@ def replay_validation(study, destination):
             raise ValueError('Source study changed during replay')
         _verified_validation(study)
         _write(output/'replay-verification.json',dict(status='verified',source_manifest_sha256=source_sha,
-            code_id=manifest['code_id'],data_id=manifest['data_id'],deterministic_files=hashes,
+            code_id=manifest['code_id'],data_id=manifest['data_id'],source_inventory_verified=True,deterministic_files=hashes,
             convention='Financial, signal and parameter hashes match; actual timestamps and backend provenance are retained independently'))
         _seal_validation(output,manifest['data_id'],manifest['code_id'])
         output.rename(destination)
     return report
 
 
-def _candidate_recipes(selection, raw_recipe):
+def _grid_cases(search):
+    """Expand finite declarations; recipe semantics remain with the ordinary loader."""
+    if not isinstance(search,dict) or set(search)!={'method','parameters'} or search['method']!='grid':
+        raise ValueError('Explicit grid method and parameters required')
+    axes=search['parameters']
+    if not isinstance(axes,dict) or not axes or any(not isinstance(v,list) or not v for v in axes.values()):
+        raise ValueError('Grid parameters require nonempty value lists')
+    count=1
+    for values in axes.values():count*=len(values)
+    if count>32:raise ValueError('Declare 1 to 32 training candidates; grid cardinality is '+str(count))
+    names=sorted(axes)
+    return [dict(id='grid-'+str(i),recipe_overrides=dict(zip(names,values)))
+            for i,values in enumerate(product(*(axes[n] for n in names)))]
+
+
+def _candidate_recipes(selection, raw_recipe, *, version=2):
     """Resolve a finite predeclared recipe search with the existing loader."""
     from ..strategies.momentum_strategy import load_recipe
-    expected={'rule','objective','minimum_complete_training_days','tie_break','candidate_failure_policy','candidates'}
+    grid=version==3 and isinstance(selection,dict) and 'search' in selection
+    expected={'rule','objective','minimum_complete_training_days','tie_break','candidate_failure_policy',('search' if grid else 'candidates')}
     if not isinstance(selection,dict) or set(selection)-{'no_eligible_score_fallback'}!=expected or selection['rule']!='training_rank':
         raise ValueError('Explicit supported training selection fields required')
     if selection['objective'] not in ('net_return','annualised_daily_sharpe'):
@@ -190,10 +273,10 @@ def _candidate_recipes(selection, raw_recipe):
         raise ValueError('Declare recipe-hash tie break and fail_fold candidate policy')
     if type(selection['minimum_complete_training_days']) is not int or selection['minimum_complete_training_days']<1:
         raise ValueError('Positive minimum complete training days required')
-    cases=selection['candidates']
+    cases=_grid_cases(selection['search']) if grid else selection['candidates']
     if not isinstance(cases,list) or not 1<=len(cases)<=32:
         raise ValueError('Declare 1 to 32 training candidates')
-    result=[];ids=set();hashes=set()
+    result=[];ids=set();hashes=set();recipes=[]
     with tempfile.TemporaryDirectory(prefix='validation-recipes-') as temporary:
         path=Path(temporary)/'recipe.json'
         path.write_bytes(raw_recipe);baseline=load_recipe(path)
@@ -204,17 +287,28 @@ def _candidate_recipes(selection, raw_recipe):
             if not isinstance(identity,str) or not re.fullmatch('[a-z][a-z0-9-]{0,47}',identity) or identity in ids:
                 raise ValueError('Unique safe candidate IDs required')
             if not isinstance(case['recipe_overrides'],dict):raise ValueError('Recipe overrides must be an object')
-            raw=dict(json.loads(raw_recipe),**case['recipe_overrides'])
-            path.write_text(json.dumps(raw))
-            resolved=load_recipe(path)
-            if any(getattr(resolved,key)!=getattr(baseline,key) for key in
-                   ('symbol_budgets','weight_caps','allocation_policy','rebalance','annualisation_hours')):
-                raise ValueError('Candidate comparison assumptions must keep allocation, universe and annualisation fixed')
-            content=json.dumps(asdict(resolved),sort_keys=True,separators=(',',':'),default=str,allow_nan=False)
-            sha=hashlib.sha256(content.encode()).hexdigest()
-            if sha in hashes:raise ValueError('Duplicate resolved candidate recipes')
-            ids.add(identity);hashes.add(sha)
-            result.append(dict(id=identity,recipe=json.loads(content),recipe_sha256=sha,warmup_bars=resolved.warmup_bars))
+            try:
+                raw=dict(json.loads(raw_recipe),**case['recipe_overrides'])
+                path.write_text(json.dumps(raw))
+                resolved=load_recipe(path)
+                if any(getattr(resolved,key)!=getattr(baseline,key) for key in
+                       ('symbol_budgets','weight_caps','allocation_policy','rebalance','annualisation_hours')):
+                    raise ValueError('Candidate comparison assumptions must keep allocation, universe and annualisation fixed')
+                payload=asdict(resolved)
+                content=json.dumps(payload,sort_keys=True,separators=(',',':'),default=str,allow_nan=False)
+                sha=hashlib.sha256(content.encode()).hexdigest()
+                if sha in hashes or (version==3 and resolved in recipes):raise ValueError('Duplicate resolved candidate recipes')
+                if grid:identity='grid-'+sha[:40]
+                if identity in ids:raise ValueError('Candidate ID collision')
+                ids.add(identity);hashes.add(sha);recipes.append(resolved)
+                result.append(dict(id=identity,recipe=json.loads(content),recipe_sha256=sha,warmup_bars=resolved.warmup_bars))
+                if version==3:result[-1].update(coordinates=case['recipe_overrides'],parameters=payload)
+            except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+                if not grid:raise
+                raise ValueError('Grid coordinates '+json.dumps(case['recipe_overrides'],sort_keys=True)+': '+str(error)) from error
+    if version==3:
+        names=sorted({key for case in cases for key in case['recipe_overrides']})
+        for candidate in result:candidate['parameters']={key:candidate['parameters'][key] for key in names}
     fallback=selection.get('no_eligible_score_fallback')
     if fallback is not None and fallback not in ids:
         raise ValueError('Fallback must name a predeclared candidate')
@@ -244,7 +338,7 @@ def _generated_folds(plan, warmup):
         raise ValueError('Test windows must not overlap')
     if window['partial_final_fold'] not in ('drop','include','reject'):
         raise ValueError('Explicit partial_final_fold policy required')
-    maximum=1056 if plan['selection_rule']=='training_rank' else 257
+    maximum=(256*(32+1)+1 if plan['schema']=='chronological-validation-v3' else 1056) if plan['selection_rule']=='training_rank' else 257
     if type(plan['max_evaluations']) is not int or not 1<=plan['max_evaluations']<=maximum:
         raise ValueError('Evaluation budget must be 1 to '+str(maximum))
     hour=timedelta(hours=1)
@@ -287,7 +381,8 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
     plan=json.loads(raw_plan);base=json.loads(raw_config)
     required={'schema','name','hypothesis','capital_policy','selection_rule','recipe_sha256',
               'inspected_through','prior_trials','statistics','folds'}
-    generated=isinstance(plan,dict) and plan.get('schema')=='chronological-validation-v2'
+    version=3 if isinstance(plan,dict) and plan.get('schema')=='chronological-validation-v3' else 2
+    generated=isinstance(plan,dict) and plan.get('schema') in ('chronological-validation-v2','chronological-validation-v3')
     ranking=generated and plan.get('selection_rule')=='training_rank'
     continuous=isinstance(plan,dict) and plan.get('capital_policy')=='continuous_account'
     if generated:
@@ -295,6 +390,7 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
     if ranking:required=required|{'selection'}
     if not isinstance(plan,dict) or set(plan)!=required:
         raise ValueError('Explicit supported validation plan fields required')
+    if version==3 and not ranking:raise ValueError('Grid-capable v3 plans require training_rank selection')
     if plan['selection_rule']!='frozen_recipe' and not ranking:
         raise ValueError('Only predeclared frozen_recipe selection is supported; no full-sample selection')
     if any(not isinstance(plan[k],str) or not plan[k].strip() for k in ('name','hypothesis')):
@@ -303,14 +399,14 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
         raise ValueError('Explicit known/unknown prior trial history required')
     if plan['inspected_through'] is not None:utc(plan['inspected_through'])
     validate_statistics_options(plan['statistics'])
-    if plan['schema'] not in ('chronological-validation-v1','chronological-validation-v2') or plan['capital_policy'] not in ('independent_reset_accounts','continuous_account') or (continuous and not generated):
+    if plan['schema'] not in ('chronological-validation-v1','chronological-validation-v2','chronological-validation-v3') or plan['capital_policy'] not in ('independent_reset_accounts','continuous_account') or (continuous and not generated):
         raise ValueError('Explicit supported validation and capital/reset policy required')
     if not generated and (dry_run or resolved_plan_path is not None):
-        raise ValueError('Preview and frozen resolved plans require chronological-validation-v2; run v1 explicit folds directly')
+        raise ValueError('Preview and frozen resolved plans require chronological-validation-v2/v3; run v1 explicit folds directly')
     if hashlib.sha256(raw_recipe).hexdigest()!=plan['recipe_sha256']:
         raise ValueError('Selected recipe differs from the declared recipe hash')
     windows=[]
-    candidates=_candidate_recipes(plan['selection'],raw_recipe) if ranking else []
+    candidates=_candidate_recipes(plan['selection'],raw_recipe,version=version) if ranking else []
     if generated:
         from ..strategies.momentum_strategy import load_recipe
         resolved_recipe=load_recipe(recipe)
@@ -356,6 +452,15 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
     if continuous and any(utc(a['test_end'])!=utc(b['test_start']) for a,b in zip(folds,folds[1:])):
         raise ValueError('Continuous account requires contiguous test coverage')
     source=QualifiedSpotSource(snapshot);code_id,code_files=source_snapshot()
+    if version==3:
+        from ..strategies.momentum_strategy import MomentumRecipe
+        for candidate in candidates:
+            try:
+                MomentumRecipe(**candidate['recipe']).validate_availability(source.availability_policy)
+            except ValueError as error:
+                label=('Grid coordinates '+json.dumps(candidate['coordinates'],sort_keys=True)
+                       if 'coordinates' in candidate else 'Candidate '+candidate['id'])
+                raise ValueError(label+': '+str(error)) from error
     if source.availability_policy=='observed_hourly_preserve_state_v1':
         for window in windows:
             window['training_history_start']=source.history_start(window['train_start'],window['warmup_bars'])
@@ -366,7 +471,7 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
     if generated and base['interval_seconds']!=3600:
         raise ValueError('Generated momentum validation requires hourly bars')
     if portable and (not generated or data_repository is None):
-        raise ValueError('Portable validation requires a v2 plan and a native data repository')
+        raise ValueError('Portable validation requires a v2/v3 plan and a native data repository')
     if type(execution_delay_bars) is not int or not 0<=execution_delay_bars<=168:
         raise ValueError('Execution delay must be an integer from 0 to 168 bars')
     if (liquidity_path is None)!=(liquidity_policy is None):
@@ -506,6 +611,7 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
                         reason='insufficient_complete_training_days'
                     trial.update(recipe_sha256=candidate['recipe_sha256'],metrics=metrics,score=score,eligible=reason is None,
                         ineligible_reason=reason)
+                    if version==3:trial['parameters']=candidate['parameters']
                 valid=sorted((t for t in trials if t['eligible']),key=lambda t:t['recipe_sha256'])
                 # Stable descending comparison preserves the hash order for exact ties.
                 # Arithmetic on Decimal scores would round under the caller's context.
@@ -528,12 +634,17 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
                     candidate=next(c for c in candidates if c['id']==winner['case_id'])
                     recipe_path=folder/'selected-recipe.json'
                     shutil.copyfile(common/'candidates'/(candidate['id']+'.json'),recipe_path)
+                    if version==3:selection['selected_parameters']=candidate['parameters']
                     bounds=(source.history_start(window['test_start'],candidate['warmup_bars']),window['test_end'])
                     selection.update(training_history_start=source.history_start(window['train_start'],candidate['warmup_bars']),
                         test_history_start=bounds[0])
                 _write(folder/'selection.json',selection)
                 if not winner:raise ValueError('Training selection failed; no test run permitted')
                 context.update(validation_phase='test',selection=selection)
+                reasons=eligibility_reasons(fold,plan,[r['symbol'] for r in base['rules']],selection=selection)
+                designation='development' if reasons else 'test'
+                evidence.update(designation=designation,eligible=not reasons,eligibility_reasons=reasons)
+                context['research_record']['designation']=designation
             if continuous:
                 test_schedules.append(dict(fold=fold['id'],start=utc(fold['test_start']),end=utc(fold['test_end']),
                     history_start=bounds[0],recipe_path=recipe_path))
@@ -543,7 +654,7 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
             history=dict(history,status='incomplete_after_training_selection')
         segments=[];primary_segments=[]
         for row,fold in zip(records,folds):
-            reasons=eligibility_reasons(fold,plan,[r['symbol'] for r in base['rules']])
+            reasons=eligibility_reasons(fold,plan,[r['symbol'] for r in base['rules']],selection=selections.get(fold['id']))
             if row['status']!='succeeded':reasons.append('failed_fold')
             row.update(designation='development' if reasons else 'test',requested_designation=fold['designation'],
                        eligible=not reasons,eligibility_reasons=reasons,path=[],
@@ -614,6 +725,8 @@ def run_validation(snapshot, config, recipe, plan_path, destination, *, auxiliar
             report.update(evidence_kind='historical_walk_forward',selections=selections,
                 trial_history=dict(prior=plan['prior_trials'],status=history['status'],training_trial_count=sum(len(s['trials']) for s in selections.values()),
                     effective_independent_trials=None,convention='Candidates and folds are dependent; no automatic independent trial count'))
+        if ranking and version==3:
+            report['candidate_search']=_search_evidence(plan,candidates,len(folds),evaluation_count,report['trial_history']['training_trial_count'])
         _write(stage/'validation.json',report)
         write_workbook(stage/'validation.xlsx',validation_frames(report))
         with zipfile.ZipFile(stage/'source.zip','w',compression=zipfile.ZIP_DEFLATED) as archive:

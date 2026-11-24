@@ -17,15 +17,15 @@ T = datetime(2026, 5, 1, tzinfo=timezone.utc)
 H = timedelta(hours=1)
 
 
-def make_inputs(root, trend=False, symbols=('BTCUSDT', 'ETHUSDT', 'SOLUSDT')):
-    report = dict(kind='spot-archive-comparison', interval='1h', start=T.isoformat(),
-                  end=(T + 744 * H).isoformat(), native_file='native.jsonl', comparisons=[])
+def make_inputs(root, trend=False, symbols=('BTCUSDT', 'ETHUSDT', 'SOLUSDT'), *, start=T):
+    report = dict(kind='spot-archive-comparison', interval='1h', start=start.isoformat(),
+                  end=(start + 744 * H).isoformat(), native_file='native.jsonl', comparisons=[])
     native = []
     for ident, symbol in enumerate(symbols, 1):
         stream = io.StringIO()
         writer = csv.writer(stream)
         for i in range(744):
-            stamp = T + i * H
+            stamp = start + i * H
             micros = int(stamp.timestamp()) * 1000000
             base=100+i if trend else 100
             writer.writerow([micros, str(base), str(base+10), str(base-10), str(base+5), '10',
@@ -35,7 +35,7 @@ def make_inputs(root, trend=False, symbols=('BTCUSDT', 'ETHUSDT', 'SOLUSDT')):
                 low=Decimal(base-10), close=Decimal(base+5), volume=Decimal('10'), trade_count=5,
                 quote_volume=Decimal('1000'), taker_buy_base_volume=Decimal('4'),
                 taker_buy_quote_volume=Decimal('400'))))
-        filename = f'{symbol}-1h-2026-05.zip'
+        filename = f'{symbol}-1h-{start:%Y-%m}.zip'
         with zipfile.ZipFile(root / filename, 'w') as archive:
             archive.writestr(filename.replace('.zip', '.csv'), stream.getvalue())
         sha = hashlib.sha256((root / filename).read_bytes()).hexdigest()
